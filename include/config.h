@@ -2,8 +2,8 @@
 // Created by honeybadger on 26. 5. 17..
 //
 
-#ifndef UNTITLED_CONFIG_H
-#define UNTITLED_CONFIG_H
+#ifndef ESP32S3_CONFIG_H
+#define ESP32S3_CONFIG_H
 
 // ==========================================
 // 💡 HARDWARE CONFIGURATION (보드 고유 스펙)
@@ -18,7 +18,7 @@
 #define WIFI_PASSWORD   "9H421306A#"
 
 // 🚀 OTA CONFIGURATION (무선 배포 설정)
-#define OTA_HOSTNAME    "myesp32"       // 앞으로 IP 대신 쓸 이름 (보드 도메인)
-#define OTA_PASSWORD    "myesp32!"      // 무선 코드를 밀어 넣을 때 쓸 인증 암호
+#define OTA_HOSTNAME    "esp32s3"       // 앞으로 IP 대신 쓸 이름 (보드 도메인)
+#define OTA_PASSWORD    "esp32s3!"      // 무선 코드를 밀어 넣을 때 쓸 인증 암호
 
-#endif //UNTITLED_CONFIG_H
+#endif //ESP32S3_CONFIG_H
