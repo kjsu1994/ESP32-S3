@@ -179,3 +179,7 @@ The test: Every changed line should trace directly to the user's request.
 3. REST 기반 초기 등록 및 설정 조회 추가
 4. telemetry / command / state 보고 로직 분리
 5. 그 위에 자동화 로직 추가
+
+
+## 사용자가 확인할 명령어 모음
+pio run -e esp32s3-ota -t upload  ota업로드
