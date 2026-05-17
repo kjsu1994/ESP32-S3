@@ -17,4 +17,8 @@
 #define WIFI_SSID       "U+NetC650"
 #define WIFI_PASSWORD   "9H421306A#"
 
+// 🚀 OTA CONFIGURATION (무선 배포 설정)
+#define OTA_HOSTNAME    "myesp32"       // 앞으로 IP 대신 쓸 이름 (보드 도메인)
+#define OTA_PASSWORD    "myesp32!"      // 무선 코드를 밀어 넣을 때 쓸 인증 암호
+
 #endif //UNTITLED_CONFIG_H

@@ -3,6 +3,6 @@
   <component name="ArduinoSettingsState">
     <option name="comPort" value="COM3" />
     <option name="serialPort" value="COM3" />
-    <option name="activeBackend" value="arduino-cli" />
+    <option name="activeBackend" value="platformio" />
   </component>
 </project>
