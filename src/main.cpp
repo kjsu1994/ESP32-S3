@@ -1,13 +1,25 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
+#include <time.h>
 
+#include "home_iot_tls.h"
 #include "config.h"
+
+#ifndef HOME_IOT_TLS_CA_CERT
+#define HOME_IOT_TLS_CA_CERT ISRG_ROOT_X1_CA_CERT
+#endif
+
+#ifndef HOME_IOT_TLS_ALLOW_INSECURE
+#define HOME_IOT_TLS_ALLOW_INSECURE false
+#endif
 
 namespace {
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
@@ -16,6 +28,10 @@ constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
 constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 constexpr uint32_t HEALTH_REPORT_INTERVAL_MS = 30000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
+constexpr uint32_t TELEMETRY_REPORT_INTERVAL_MS = 60000;
+constexpr uint32_t TLS_TIME_SYNC_TIMEOUT_MS = 10000;
+constexpr const char* DEVICE_TOKEN_PREF_NAMESPACE = "homeiot";
+constexpr const char* DEVICE_TOKEN_PREF_KEY = "api_token";
 
 enum class LedMode {
     STATUS,
@@ -26,14 +42,19 @@ enum class LedMode {
 Adafruit_NeoPixel pixelPrimary(BOARD_RGB_COUNT, BOARD_INTERNAL_RGB_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel pixelAlternate(BOARD_RGB_COUNT, BOARD_INTERNAL_RGB_ALT_PIN, NEO_GRB + NEO_KHZ800);
 WiFiClient mqttNetworkClient;
+WiFiClientSecure httpsClient;
 PubSubClient mqttClient(mqttNetworkClient);
+Preferences preferences;
 
 bool otaInProgress = false;
 bool otaReady = false;
 bool deviceRegistered = false;
 bool stateDirty = true;
 bool lastWifiConnected = false;
+bool lastMqttConnected = false;
 bool rebootRequested = false;
+bool bootTelemetrySent = false;
+bool wifiReconnectedTelemetryPending = false;
 int lastOtaProgressPercent = -1;
 
 uint32_t lastHealthReportAt = 0;
@@ -41,9 +62,11 @@ uint32_t lastReconnectAttemptAt = 0;
 uint32_t lastMqttReconnectAttemptAt = 0;
 uint32_t rebootRequestedAt = 0;
 uint32_t lastCommandPollAt = 0;
+uint32_t lastTelemetryReportAt = 0;
 
 LedMode ledMode = LedMode::STATUS;
 String deviceId;
+String deviceApiToken;
 
 void setStatusColor(uint8_t r, uint8_t g, uint8_t b) {
     pixelPrimary.setPixelColor(0, pixelPrimary.Color(r, g, b));
@@ -80,7 +103,78 @@ String boolToJson(bool value) {
 }
 
 String buildApiUrl(const String& path) {
-    return String("http://") + HOME_IOT_SERVER_HOST + ":" + String(HOME_IOT_SERVER_PORT) + path;
+    String endpoint = path;
+    if (endpoint.startsWith("/api/")) {
+        endpoint = endpoint.substring(4);
+    } else if (endpoint == "/api") {
+        endpoint = "";
+    }
+
+    String basePath = HOME_IOT_API_BASE_PATH;
+    if (basePath.endsWith("/")) {
+        basePath.remove(basePath.length() - 1);
+    }
+
+    String portPart;
+    const bool defaultHttpPort = String(HOME_IOT_API_SCHEME) == "http" && HOME_IOT_SERVER_PORT == 80;
+    const bool defaultHttpsPort = String(HOME_IOT_API_SCHEME) == "https" && HOME_IOT_SERVER_PORT == 443;
+    if (!defaultHttpPort && !defaultHttpsPort) {
+        portPart = ":" + String(HOME_IOT_SERVER_PORT);
+    }
+
+    return String(HOME_IOT_API_SCHEME) + "://" + HOME_IOT_SERVER_HOST + portPart + basePath + endpoint;
+}
+
+bool beginHttpClient(HTTPClient& http, const String& url) {
+    if (String(HOME_IOT_API_SCHEME) == "https") {
+        if (HOME_IOT_TLS_ALLOW_INSECURE) {
+            httpsClient.setInsecure();
+        } else {
+            httpsClient.setCACert(HOME_IOT_TLS_CA_CERT);
+        }
+        return http.begin(httpsClient, url);
+    }
+
+    return http.begin(url);
+}
+
+bool syncTlsClock() {
+    if (String(HOME_IOT_API_SCHEME) != "https") {
+        return true;
+    }
+
+    Serial.println("[TLS] Syncing clock for certificate validation");
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+
+    const uint32_t startedAt = millis();
+    time_t now = time(nullptr);
+    while (now < 1704067200 && millis() - startedAt < TLS_TIME_SYNC_TIMEOUT_MS) {
+        delay(250);
+        now = time(nullptr);
+    }
+
+    if (now < 1704067200) {
+        Serial.println("[TLS] Clock sync failed; HTTPS certificate validation may fail");
+        return false;
+    }
+
+    Serial.printf("[TLS] Clock synced: %ld\n", static_cast<long>(now));
+    return true;
+}
+
+String activeDeviceApiKey() {
+    if (!deviceApiToken.isEmpty()) {
+        return deviceApiToken;
+    }
+    return HOME_IOT_DEVICE_API_KEY;
+}
+
+void addJsonHeaders(HTTPClient& http) {
+    http.addHeader("Content-Type", "application/json");
+    const String apiKey = activeDeviceApiKey();
+    if (!apiKey.isEmpty()) {
+        http.addHeader("X-Device-Api-Key", apiKey);
+    }
 }
 
 String buildDeviceId() {
@@ -182,29 +276,45 @@ void updateStatusLed() {
     }
 }
 
-bool postJson(const String& url, const String& payload) {
+int postJsonForStatusResponse(const String& url, const String& payload, String& responseBody) {
     HTTPClient http;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
+    if (!beginHttpClient(http, url)) {
+        Serial.printf("[HTTP] POST %s begin failed\n", url.c_str());
+        return -1;
+    }
+    addJsonHeaders(http);
 
     const int statusCode = http.POST(payload);
-    const String responseBody = http.getString();
+    responseBody = http.getString();
     http.end();
 
     if (statusCode < 200 || statusCode >= 300) {
         Serial.printf("[HTTP] POST %s failed. status=%d body=%s\n",
                       url.c_str(), statusCode, responseBody.c_str());
-        return false;
+        return statusCode;
     }
 
     Serial.printf("[HTTP] POST %s ok. status=%d\n", url.c_str(), statusCode);
-    return true;
+    return statusCode;
+}
+
+bool postJsonForResponse(const String& url, const String& payload, String& responseBody) {
+    const int statusCode = postJsonForStatusResponse(url, payload, responseBody);
+    return statusCode >= 200 && statusCode < 300;
+}
+
+bool postJson(const String& url, const String& payload) {
+    String responseBody;
+    return postJsonForResponse(url, payload, responseBody);
 }
 
 bool patchJson(const String& url, const String& payload) {
     HTTPClient http;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
+    if (!beginHttpClient(http, url)) {
+        Serial.printf("[HTTP] PATCH %s begin failed\n", url.c_str());
+        return false;
+    }
+    addJsonHeaders(http);
 
     const int statusCode = http.PATCH(payload);
     const String responseBody = http.getString();
@@ -222,7 +332,14 @@ bool patchJson(const String& url, const String& payload) {
 
 bool getJson(const String& url, String& responseBody) {
     HTTPClient http;
-    http.begin(url);
+    if (!beginHttpClient(http, url)) {
+        Serial.printf("[HTTP] GET %s begin failed\n", url.c_str());
+        return false;
+    }
+    const String apiKey = activeDeviceApiKey();
+    if (!apiKey.isEmpty()) {
+        http.addHeader("X-Device-Api-Key", apiKey);
+    }
 
     const int statusCode = http.GET();
     responseBody = http.getString();
@@ -247,6 +364,15 @@ String buildReportedStateJson() {
            "}";
 }
 
+String buildBootTelemetryJson() {
+    return String("{\"fw_version\":\"") + FW_VERSION +
+           "\",\"device_type\":\"" + DEVICE_TYPE +
+           "\",\"ip\":\"" + WiFi.localIP().toString() +
+           "\",\"rssi\":" + String(WiFi.RSSI()) +
+           ",\"free_heap\":" + String(ESP.getFreeHeap()) +
+           "}";
+}
+
 bool registerDevice() {
     if (WiFi.status() != WL_CONNECTED) {
         return false;
@@ -262,7 +388,25 @@ bool registerDevice() {
             ",\"owner_member_id\":" + String(HOME_IOT_OWNER_MEMBER_ID) +
             "}";
 
-    deviceRegistered = postJson(buildApiUrl("/api/devices/register"), payload);
+    String responseBody;
+    const String registerUrl = buildApiUrl("/api/devices/register");
+    int statusCode = postJsonForStatusResponse(registerUrl, payload, responseBody);
+    if ((statusCode == 401 || statusCode == 403) && !deviceApiToken.isEmpty()) {
+        Serial.println("[AUTH] Stored device API key rejected; clearing token and retrying bootstrap registration");
+        deviceApiToken = "";
+        preferences.remove(DEVICE_TOKEN_PREF_KEY);
+        statusCode = postJsonForStatusResponse(registerUrl, payload, responseBody);
+    }
+
+    deviceRegistered = statusCode >= 200 && statusCode < 300;
+    if (deviceRegistered) {
+        const String issuedKey = extractJsonString(responseBody, "device_api_key");
+        if (!issuedKey.isEmpty() && issuedKey != deviceApiToken) {
+            deviceApiToken = issuedKey;
+            preferences.putString(DEVICE_TOKEN_PREF_KEY, deviceApiToken);
+            Serial.println("[AUTH] Stored device-specific API key");
+        }
+    }
     return deviceRegistered;
 }
 
@@ -311,6 +455,23 @@ bool reportState() {
         stateDirty = false;
     }
     return ok;
+}
+
+bool reportTelemetry(const String& eventType, const String& payloadJson) {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    if (!deviceRegistered && !registerDevice()) {
+        return false;
+    }
+
+    const String payload =
+            String("{\"event_type\":\"") + eventType +
+            "\",\"payload_json\":\"" + escapeJson(payloadJson) +
+            "\"}";
+
+    return postJson(buildApiUrl("/api/devices/") + deviceId + "/telemetry", payload);
 }
 
 bool reportOtaStatus(const String& otaStatus, int progressPercent, const String& message) {
@@ -536,6 +697,7 @@ bool connectToWifi() {
     Serial.print("[WIFI] RSSI: ");
     Serial.println(WiFi.RSSI());
     Serial.printf("[WIFI] OTA host: %s.local\n", OTA_HOSTNAME);
+    syncTlsClock();
     return true;
 }
 
@@ -584,9 +746,12 @@ void handleNetworkSync() {
         if (!wifiConnected) {
             otaReady = false;
             deviceRegistered = false;
+            bootTelemetrySent = false;
+            lastMqttConnected = false;
             mqttClient.disconnect();
             Serial.println("[WIFI] Connection lost");
         } else {
+            wifiReconnectedTelemetryPending = true;
             Serial.println("[WIFI] Connection restored");
         }
     }
@@ -612,6 +777,19 @@ void handleNetworkSync() {
     }
 
     const uint32_t now = millis();
+
+    if (deviceRegistered && !bootTelemetrySent) {
+        if (reportTelemetry("boot", buildBootTelemetryJson())) {
+            bootTelemetrySent = true;
+        }
+    }
+
+    if (deviceRegistered && wifiReconnectedTelemetryPending) {
+        if (reportTelemetry("wifi_reconnected", buildReportedStateJson())) {
+            wifiReconnectedTelemetryPending = false;
+        }
+    }
+
     if (!mqttClient.connected() && now - lastMqttReconnectAttemptAt >= MQTT_RECONNECT_INTERVAL_MS) {
         lastMqttReconnectAttemptAt = now;
         connectMqtt();
@@ -625,8 +803,21 @@ void handleNetworkSync() {
         reportState();
     }
 
+    const bool mqttConnected = mqttClient.connected();
+    if (mqttConnected != lastMqttConnected) {
+        lastMqttConnected = mqttConnected;
+        stateDirty = true;
+        reportTelemetry(mqttConnected ? "mqtt_connected" : "mqtt_disconnected", buildReportedStateJson());
+    }
+
     if (now - lastHealthReportAt >= HEALTH_REPORT_INTERVAL_MS) {
         reportHealth();
+    }
+
+    if (now - lastTelemetryReportAt >= TELEMETRY_REPORT_INTERVAL_MS) {
+        if (reportTelemetry("heartbeat", buildReportedStateJson())) {
+            lastTelemetryReportAt = now;
+        }
     }
 
     if (now - lastCommandPollAt >= COMMAND_POLL_INTERVAL_MS) {
@@ -641,6 +832,8 @@ void setup() {
     delay(1000);
 
     deviceId = buildDeviceId();
+    preferences.begin(DEVICE_TOKEN_PREF_NAMESPACE, false);
+    deviceApiToken = preferences.getString(DEVICE_TOKEN_PREF_KEY, "");
 
     pixelPrimary.begin();
     pixelPrimary.setBrightness(40);
@@ -653,6 +846,7 @@ void setup() {
     Serial.printf("[BOOT] Chip model: %s\n", ESP.getChipModel());
     Serial.printf("[BOOT] Free heap: %u bytes\n", ESP.getFreeHeap());
     Serial.printf("[BOOT] Device ID: %s\n", deviceId.c_str());
+    Serial.printf("[AUTH] Device-specific API key: %s\n", deviceApiToken.isEmpty() ? "not provisioned" : "provisioned");
 
     if (!connectToWifi()) {
         Serial.println("[BOOT] Continuing without Wi-Fi. OTA and Home_IOT sync will retry later.");
