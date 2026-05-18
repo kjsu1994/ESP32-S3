@@ -172,6 +172,7 @@ The test: Every changed line should trace directly to the user's request.
 pio run -e esp32s3-ota -t upload  ota?낅줈??
 
 ## External integration note
-- For CTFMON backend/frontend integration rules, read CTFMON_INTEGRATION.md first.
-- Prefer that document for REST, MQTT, payload, OpenAPI, and web-stack alignment decisions.
+- For Home_IOT backend/frontend integration rules, read HOME_IOT_INTEGRATION.md first.
+- Treat `C:\Users\honeybadger\Desktop\ctfmon_project` as reference-only. Do not edit it for Home_IOT work.
+- Prefer HOME_IOT_INTEGRATION.md for REST, MQTT, payload, and web-stack alignment decisions.
 

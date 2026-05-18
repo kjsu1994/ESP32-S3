@@ -1,11 +1,10 @@
 #ifndef ESP32S3_CONFIG_H
 #define ESP32S3_CONFIG_H
 
-// ==========================================
-// 💡 HARDWARE CONFIGURATION (보드 고유 스펙)
-// ==========================================
-#define BOARD_INTERNAL_RGB_PIN  48  // 내장 RGB LED 핀 번호 고정
-#define BOARD_RGB_COUNT          1  // 내장 LED 개수
+// Hardware configuration
+#define BOARD_INTERNAL_RGB_PIN 48
+#define BOARD_INTERNAL_RGB_ALT_PIN 38
+#define BOARD_RGB_COUNT 1
 
 // Wi-Fi configuration
 #define WIFI_SSID "U+NetC650"
@@ -15,9 +14,14 @@
 #define OTA_HOSTNAME "esp32s3"
 #define OTA_PASSWORD "esp32s3!"
 
-// Home_IOT backend configuration
+// Home_IOT server configuration
 #define HOME_IOT_SERVER_HOST "192.168.123.118"
 #define HOME_IOT_SERVER_PORT 8080
+#define HOME_IOT_OWNER_MEMBER_ID 1
+
+// MQTT broker configuration
+#define MQTT_BROKER_HOST "192.168.123.118"
+#define MQTT_BROKER_PORT 1883
 
 // Device metadata
 #define DEVICE_NAME "Living Room Test Board"
