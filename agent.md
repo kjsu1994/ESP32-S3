@@ -164,6 +164,18 @@ The test: Every changed line should trace directly to the user's request.
 - 재연결 이후 보드가 멈춘 상태로 빠지지 않는지
 - 백엔드 payload가 내부적으로 일관적인지
 
+## ESP32-S3 Camera 작업 기준
+
+카메라 스트리밍을 변경하기 전에 `CAMERA_STREAM_RECOVERY_NOTES.md`를 먼저 읽는다. 특히 아래 원칙을 지킨다.
+
+- 검은 화면을 바로 프론트엔드 문제로 보지 않는다. 먼저 시리얼 로그의 `Self-test ok`, `Frame ok=true`, 백엔드의 `camera ingest` 순서로 확인한다.
+- 카메라 설정은 한 번에 하나만 바꾼다. `frame_size`, `jpeg_quality`, `xclk`, `fb_location`, `fb_count`, `grab_mode`를 동시에 바꾸지 않는다.
+- 현재 확인된 안정 기준은 `VGA`, `JPEG quality 28`, `XCLK 16 MHz`, `CAMERA_FB_IN_DRAM`, `fb_count=1`, `CAMERA_GRAB_WHEN_EMPTY`이다.
+- `CAMERA_FB_IN_PSRAM` 재도입은 별도 실험으로만 한다. 이전 증상은 부팅 직후 `esp_camera_fb_get()` 실패였고, DRAM framebuffer로 회복됐다.
+- `cameraReady=false`를 1회 캡처 실패에 바로 설정하지 않는다. 일시 실패와 드라이버 실패를 로그로 구분한다.
+- 성능 문제를 볼 때는 `capture_ms`와 `upload_ms`를 분리한다. 현재 병목은 카메라 캡처보다 WebSocket/Wi-Fi 업로드 쪽으로 관측됐다.
+- FreeRTOS task 분리, 런타임 해상도 변경, SVGA/HD 증가는 안정 기준이 재확인된 뒤 별도 단계로 진행한다.
+
 ## 피해야 할 것
 
 - 로컬 디바이스 수명주기가 안정화되기 전에 과도하게 클라우드 규모 최적화부터 하지 않는다.
