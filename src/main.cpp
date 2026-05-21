@@ -37,6 +37,12 @@
 #ifndef CAMERA_JPEG_QUALITY
 #define CAMERA_JPEG_QUALITY 16
 #endif
+#ifndef CAMERA_VERTICAL_FLIP
+#define CAMERA_VERTICAL_FLIP false
+#endif
+#ifndef CAMERA_HORIZONTAL_MIRROR
+#define CAMERA_HORIZONTAL_MIRROR false
+#endif
 #ifndef CAMERA_XCLK_FREQ_HZ
 #define CAMERA_XCLK_FREQ_HZ 20000000
 #endif
@@ -645,6 +651,8 @@ bool initializeCamera() {
     if (sensor != nullptr) {
         sensor->set_framesize(sensor, CAMERA_FRAME_SIZE);
         sensor->set_quality(sensor, CAMERA_JPEG_QUALITY);
+        sensor->set_vflip(sensor, CAMERA_VERTICAL_FLIP ? 1 : 0);
+        sensor->set_hmirror(sensor, CAMERA_HORIZONTAL_MIRROR ? 1 : 0);
     }
 
     cameraReady = true;
