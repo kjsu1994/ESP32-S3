@@ -34,4 +34,29 @@
 #define DEVICE_TYPE "ESP32_S3"
 #define FW_VERSION "0.1.0"
 
+// ESP32-S3 N16R8 camera board defaults. Override these in config.local.h if your board uses another pin map.
+#define CAMERA_UPLOAD_INTERVAL_MS 1000
+#define CAMERA_HTTP_FALLBACK_INTERVAL_MS 500
+#define CAMERA_USE_WEBSOCKET true
+#define CAMERA_WEBSOCKET_RECONNECT_INTERVAL_MS 5000
+#define CAMERA_FRAME_SIZE FRAMESIZE_QVGA
+#define CAMERA_JPEG_QUALITY 16
+#define CAMERA_XCLK_FREQ_HZ 20000000
+#define CAMERA_PIN_PWDN -1
+#define CAMERA_PIN_RESET -1
+#define CAMERA_PIN_XCLK 15
+#define CAMERA_PIN_SIOD 4
+#define CAMERA_PIN_SIOC 5
+#define CAMERA_PIN_Y9 16
+#define CAMERA_PIN_Y8 17
+#define CAMERA_PIN_Y7 18
+#define CAMERA_PIN_Y6 12
+#define CAMERA_PIN_Y5 10
+#define CAMERA_PIN_Y4 8
+#define CAMERA_PIN_Y3 9
+#define CAMERA_PIN_Y2 11
+#define CAMERA_PIN_VSYNC 6
+#define CAMERA_PIN_HREF 7
+#define CAMERA_PIN_PCLK 13
+
 #endif

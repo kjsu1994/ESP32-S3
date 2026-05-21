@@ -9,9 +9,86 @@
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <time.h>
+#ifdef BOARD_HAS_CAMERA
+#include "esp_camera.h"
+#include <esp_system.h>
+#include <mbedtls/base64.h>
+#endif
 
 #include "home_iot_tls.h"
 #include "config.h"
+
+#ifdef BOARD_HAS_CAMERA
+#ifndef CAMERA_UPLOAD_INTERVAL_MS
+#define CAMERA_UPLOAD_INTERVAL_MS 1000
+#endif
+#ifndef CAMERA_HTTP_FALLBACK_INTERVAL_MS
+#define CAMERA_HTTP_FALLBACK_INTERVAL_MS 500
+#endif
+#ifndef CAMERA_USE_WEBSOCKET
+#define CAMERA_USE_WEBSOCKET true
+#endif
+#ifndef CAMERA_WEBSOCKET_RECONNECT_INTERVAL_MS
+#define CAMERA_WEBSOCKET_RECONNECT_INTERVAL_MS 5000
+#endif
+#ifndef CAMERA_FRAME_SIZE
+#define CAMERA_FRAME_SIZE FRAMESIZE_QVGA
+#endif
+#ifndef CAMERA_JPEG_QUALITY
+#define CAMERA_JPEG_QUALITY 16
+#endif
+#ifndef CAMERA_XCLK_FREQ_HZ
+#define CAMERA_XCLK_FREQ_HZ 20000000
+#endif
+#ifndef CAMERA_PIN_PWDN
+#define CAMERA_PIN_PWDN -1
+#endif
+#ifndef CAMERA_PIN_RESET
+#define CAMERA_PIN_RESET -1
+#endif
+#ifndef CAMERA_PIN_XCLK
+#define CAMERA_PIN_XCLK 15
+#endif
+#ifndef CAMERA_PIN_SIOD
+#define CAMERA_PIN_SIOD 4
+#endif
+#ifndef CAMERA_PIN_SIOC
+#define CAMERA_PIN_SIOC 5
+#endif
+#ifndef CAMERA_PIN_Y9
+#define CAMERA_PIN_Y9 16
+#endif
+#ifndef CAMERA_PIN_Y8
+#define CAMERA_PIN_Y8 17
+#endif
+#ifndef CAMERA_PIN_Y7
+#define CAMERA_PIN_Y7 18
+#endif
+#ifndef CAMERA_PIN_Y6
+#define CAMERA_PIN_Y6 12
+#endif
+#ifndef CAMERA_PIN_Y5
+#define CAMERA_PIN_Y5 10
+#endif
+#ifndef CAMERA_PIN_Y4
+#define CAMERA_PIN_Y4 8
+#endif
+#ifndef CAMERA_PIN_Y3
+#define CAMERA_PIN_Y3 9
+#endif
+#ifndef CAMERA_PIN_Y2
+#define CAMERA_PIN_Y2 11
+#endif
+#ifndef CAMERA_PIN_VSYNC
+#define CAMERA_PIN_VSYNC 6
+#endif
+#ifndef CAMERA_PIN_HREF
+#define CAMERA_PIN_HREF 7
+#endif
+#ifndef CAMERA_PIN_PCLK
+#define CAMERA_PIN_PCLK 13
+#endif
+#endif
 
 #ifndef HOME_IOT_TLS_CA_CERT
 #define HOME_IOT_TLS_CA_CERT ISRG_ROOT_X1_CA_CERT
@@ -30,6 +107,9 @@ constexpr uint32_t HEALTH_REPORT_INTERVAL_MS = 30000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t TELEMETRY_REPORT_INTERVAL_MS = 60000;
 constexpr uint32_t TLS_TIME_SYNC_TIMEOUT_MS = 10000;
+#ifdef BOARD_HAS_CAMERA
+constexpr uint32_t CAMERA_STATUS_RETRY_INTERVAL_MS = 10000;
+#endif
 constexpr const char* DEVICE_TOKEN_PREF_NAMESPACE = "homeiot";
 constexpr const char* DEVICE_TOKEN_PREF_KEY = "api_token";
 
@@ -45,6 +125,9 @@ WiFiClient mqttNetworkClient;
 WiFiClientSecure httpsClient;
 PubSubClient mqttClient(mqttNetworkClient);
 Preferences preferences;
+#ifdef BOARD_HAS_CAMERA
+WiFiClient cameraWebSocketClient;
+#endif
 
 bool otaInProgress = false;
 bool otaReady = false;
@@ -55,6 +138,12 @@ bool lastMqttConnected = false;
 bool rebootRequested = false;
 bool bootTelemetrySent = false;
 bool wifiReconnectedTelemetryPending = false;
+#ifdef BOARD_HAS_CAMERA
+bool cameraReady = false;
+bool cameraStatusDirty = true;
+bool cameraWebSocketStarted = false;
+bool cameraWebSocketConnected = false;
+#endif
 int lastOtaProgressPercent = -1;
 
 uint32_t lastHealthReportAt = 0;
@@ -63,6 +152,12 @@ uint32_t lastMqttReconnectAttemptAt = 0;
 uint32_t rebootRequestedAt = 0;
 uint32_t lastCommandPollAt = 0;
 uint32_t lastTelemetryReportAt = 0;
+#ifdef BOARD_HAS_CAMERA
+uint32_t lastCameraUploadAt = 0;
+uint32_t lastCameraStatusReportAt = 0;
+uint32_t lastCameraWebSocketReconnectAt = 0;
+uint32_t lastCameraHttpFallbackAt = 0;
+#endif
 
 LedMode ledMode = LedMode::STATUS;
 String deviceId;
@@ -102,6 +197,14 @@ String boolToJson(bool value) {
     return value ? "true" : "false";
 }
 
+const char* effectiveDeviceType() {
+#ifdef BOARD_HAS_CAMERA
+    return "ESP32S3_CAMERA";
+#else
+    return DEVICE_TYPE;
+#endif
+}
+
 String buildApiUrl(const String& path) {
     String endpoint = path;
     if (endpoint.startsWith("/api/")) {
@@ -123,6 +226,22 @@ String buildApiUrl(const String& path) {
     }
 
     return String(HOME_IOT_API_SCHEME) + "://" + HOME_IOT_SERVER_HOST + portPart + basePath + endpoint;
+}
+
+String buildApiPath(const String& path) {
+    String endpoint = path;
+    if (endpoint.startsWith("/api/")) {
+        endpoint = endpoint.substring(4);
+    } else if (endpoint == "/api") {
+        endpoint = "";
+    }
+
+    String basePath = HOME_IOT_API_BASE_PATH;
+    if (basePath.endsWith("/")) {
+        basePath.remove(basePath.length() - 1);
+    }
+
+    return basePath + endpoint;
 }
 
 bool beginHttpClient(HTTPClient& http, const String& url) {
@@ -171,6 +290,13 @@ String activeDeviceApiKey() {
 
 void addJsonHeaders(HTTPClient& http) {
     http.addHeader("Content-Type", "application/json");
+    const String apiKey = activeDeviceApiKey();
+    if (!apiKey.isEmpty()) {
+        http.addHeader("X-Device-Api-Key", apiKey);
+    }
+}
+
+void addDeviceAuthHeader(HTTPClient& http) {
     const String apiKey = activeDeviceApiKey();
     if (!apiKey.isEmpty()) {
         http.addHeader("X-Device-Api-Key", apiKey);
@@ -355,18 +481,22 @@ bool getJson(const String& url, String& responseBody) {
 }
 
 String buildReportedStateJson() {
-    return String("{\"wifi_status\":\"") + wifiStatusToString(WiFi.status()) +
+    String payload = String("{\"wifi_status\":\"") + wifiStatusToString(WiFi.status()) +
            "\",\"ota_ready\":" + boolToJson(otaReady) +
            ",\"ota_in_progress\":" + boolToJson(otaInProgress) +
            ",\"mqtt_connected\":" + boolToJson(mqttClient.connected()) +
            ",\"led_mode\":\"" + ledModeToString(ledMode) +
-           "\",\"rssi\":" + String(WiFi.RSSI()) +
-           "}";
+           "\",\"rssi\":" + String(WiFi.RSSI());
+#ifdef BOARD_HAS_CAMERA
+    payload += String(",\"camera_ready\":") + boolToJson(cameraReady);
+#endif
+    payload += "}";
+    return payload;
 }
 
 String buildBootTelemetryJson() {
     return String("{\"fw_version\":\"") + FW_VERSION +
-           "\",\"device_type\":\"" + DEVICE_TYPE +
+           "\",\"device_type\":\"" + effectiveDeviceType() +
            "\",\"ip\":\"" + WiFi.localIP().toString() +
            "\",\"rssi\":" + String(WiFi.RSSI()) +
            ",\"free_heap\":" + String(ESP.getFreeHeap()) +
@@ -381,7 +511,7 @@ bool registerDevice() {
     const String payload =
             String("{\"device_id\":\"") + deviceId +
             "\",\"name\":\"" + DEVICE_NAME +
-            "\",\"device_type\":\"" + DEVICE_TYPE +
+            "\",\"device_type\":\"" + effectiveDeviceType() +
             "\",\"fw_version\":\"" + FW_VERSION +
             "\",\"ip\":\"" + WiFi.localIP().toString() +
             "\",\"rssi\":" + String(WiFi.RSSI()) +
@@ -473,6 +603,382 @@ bool reportTelemetry(const String& eventType, const String& payloadJson) {
 
     return postJson(buildApiUrl("/api/devices/") + deviceId + "/telemetry", payload);
 }
+
+#ifdef BOARD_HAS_CAMERA
+bool initializeCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = CAMERA_PIN_Y2;
+    config.pin_d1 = CAMERA_PIN_Y3;
+    config.pin_d2 = CAMERA_PIN_Y4;
+    config.pin_d3 = CAMERA_PIN_Y5;
+    config.pin_d4 = CAMERA_PIN_Y6;
+    config.pin_d5 = CAMERA_PIN_Y7;
+    config.pin_d6 = CAMERA_PIN_Y8;
+    config.pin_d7 = CAMERA_PIN_Y9;
+    config.pin_xclk = CAMERA_PIN_XCLK;
+    config.pin_pclk = CAMERA_PIN_PCLK;
+    config.pin_vsync = CAMERA_PIN_VSYNC;
+    config.pin_href = CAMERA_PIN_HREF;
+    config.pin_sccb_sda = CAMERA_PIN_SIOD;
+    config.pin_sccb_scl = CAMERA_PIN_SIOC;
+    config.pin_pwdn = CAMERA_PIN_PWDN;
+    config.pin_reset = CAMERA_PIN_RESET;
+    config.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
+    config.frame_size = CAMERA_FRAME_SIZE;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+    config.jpeg_quality = CAMERA_JPEG_QUALITY;
+    config.fb_count = psramFound() ? 2 : 1;
+
+    const esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        cameraReady = false;
+        cameraStatusDirty = true;
+        Serial.printf("[CAMERA] Init failed: 0x%x\n", err);
+        return false;
+    }
+
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor != nullptr) {
+        sensor->set_framesize(sensor, CAMERA_FRAME_SIZE);
+        sensor->set_quality(sensor, CAMERA_JPEG_QUALITY);
+    }
+
+    cameraReady = true;
+    cameraStatusDirty = true;
+    Serial.println("[CAMERA] Ready");
+    return true;
+}
+
+bool reportCameraStatus(const String& message) {
+    if (WiFi.status() != WL_CONNECTED || !deviceRegistered) {
+        return false;
+    }
+
+    const String payload =
+            String("{\"camera_ready\":") + boolToJson(cameraReady) +
+            ",\"message\":\"" + escapeJson(message) + "\"}";
+
+    const bool ok = postJson(buildApiUrl("/api/devices/") + deviceId + "/camera/status", payload);
+    if (ok) {
+        cameraStatusDirty = false;
+        lastCameraStatusReportAt = millis();
+    }
+    return ok;
+}
+
+String base64EncodeBytes(const uint8_t* data, size_t length) {
+    size_t encodedLength = 0;
+    mbedtls_base64_encode(nullptr, 0, &encodedLength, data, length);
+    char* encoded = static_cast<char*>(malloc(encodedLength + 1));
+    if (encoded == nullptr) {
+        return "";
+    }
+
+    size_t actualLength = 0;
+    const int result = mbedtls_base64_encode(reinterpret_cast<unsigned char*>(encoded),
+                                            encodedLength + 1,
+                                            &actualLength,
+                                            data,
+                                            length);
+    if (result != 0) {
+        free(encoded);
+        return "";
+    }
+
+    encoded[actualLength] = '\0';
+    String value(encoded);
+    free(encoded);
+    return value;
+}
+
+String buildWebSocketKey() {
+    uint8_t bytes[16];
+    for (uint8_t i = 0; i < sizeof(bytes); i += 4) {
+        const uint32_t randomValue = esp_random();
+        bytes[i] = static_cast<uint8_t>((randomValue >> 24) & 0xFF);
+        bytes[i + 1] = static_cast<uint8_t>((randomValue >> 16) & 0xFF);
+        bytes[i + 2] = static_cast<uint8_t>((randomValue >> 8) & 0xFF);
+        bytes[i + 3] = static_cast<uint8_t>(randomValue & 0xFF);
+    }
+    return base64EncodeBytes(bytes, sizeof(bytes));
+}
+
+String readCameraWebSocketLine(uint32_t timeoutMs) {
+    String line;
+    const uint32_t startedAt = millis();
+    while (millis() - startedAt < timeoutMs) {
+        while (cameraWebSocketClient.available()) {
+            const char character = static_cast<char>(cameraWebSocketClient.read());
+            if (character == '\n') {
+                if (line.endsWith("\r")) {
+                    line.remove(line.length() - 1);
+                }
+                return line;
+            }
+            line += character;
+            if (line.length() > 512) {
+                return line;
+            }
+        }
+        delay(1);
+    }
+    return line;
+}
+
+bool writeCameraWebSocketBytes(const uint8_t* data, size_t length) {
+    size_t written = 0;
+    uint32_t lastProgressAt = millis();
+    while (written < length) {
+        if (!cameraWebSocketClient.connected()) {
+            return false;
+        }
+
+        const size_t count = cameraWebSocketClient.write(data + written, length - written);
+        if (count > 0) {
+            written += count;
+            lastProgressAt = millis();
+            continue;
+        }
+
+        if (millis() - lastProgressAt > 3000) {
+            return false;
+        }
+        delay(1);
+    }
+    return true;
+}
+
+void handleCameraWebSocket() {
+    if (!cameraWebSocketConnected) {
+        return;
+    }
+
+    if (!cameraWebSocketClient.connected()) {
+        cameraWebSocketClient.stop();
+        cameraWebSocketConnected = false;
+        cameraWebSocketStarted = false;
+        Serial.println("[CAMERA] WebSocket disconnected");
+        return;
+    }
+
+    while (cameraWebSocketClient.available()) {
+        cameraWebSocketClient.read();
+    }
+}
+
+bool connectCameraWebSocket() {
+    if (!CAMERA_USE_WEBSOCKET || WiFi.status() != WL_CONNECTED || !deviceRegistered) {
+        return false;
+    }
+    if (String(HOME_IOT_API_SCHEME) != "http") {
+        return false;
+    }
+
+    if (cameraWebSocketConnected && cameraWebSocketClient.connected()) {
+        return true;
+    }
+
+    const uint32_t now = millis();
+    if (cameraWebSocketStarted && now - lastCameraWebSocketReconnectAt < CAMERA_WEBSOCKET_RECONNECT_INTERVAL_MS) {
+        return cameraWebSocketConnected;
+    }
+
+    lastCameraWebSocketReconnectAt = now;
+    const String path = buildApiPath("/api/devices/") + deviceId + "/camera/ws";
+    const String apiKey = activeDeviceApiKey();
+    cameraWebSocketStarted = true;
+    Serial.printf("[CAMERA] WebSocket connecting ws://%s:%d%s\n",
+                  HOME_IOT_SERVER_HOST,
+                  HOME_IOT_SERVER_PORT,
+                  path.c_str());
+
+    cameraWebSocketConnected = false;
+    cameraWebSocketClient.stop();
+    cameraWebSocketClient.setTimeout(2000);
+    if (!cameraWebSocketClient.connect(HOME_IOT_SERVER_HOST, HOME_IOT_SERVER_PORT)) {
+        Serial.println("[CAMERA] WebSocket TCP connect failed");
+        return false;
+    }
+
+    const String webSocketKey = buildWebSocketKey();
+    if (webSocketKey.isEmpty()) {
+        cameraWebSocketClient.stop();
+        return false;
+    }
+
+    cameraWebSocketClient.print(String("GET ") + path + " HTTP/1.1\r\n");
+    cameraWebSocketClient.print(String("Host: ") + HOME_IOT_SERVER_HOST + ":" + String(HOME_IOT_SERVER_PORT) + "\r\n");
+    cameraWebSocketClient.print("Upgrade: websocket\r\n");
+    cameraWebSocketClient.print("Connection: Upgrade\r\n");
+    cameraWebSocketClient.print("Sec-WebSocket-Version: 13\r\n");
+    cameraWebSocketClient.print(String("Sec-WebSocket-Key: ") + webSocketKey + "\r\n");
+    if (!apiKey.isEmpty()) {
+        cameraWebSocketClient.print(String("X-Device-Api-Key: ") + apiKey + "\r\n");
+    }
+    cameraWebSocketClient.print("\r\n");
+
+    const String statusLine = readCameraWebSocketLine(3000);
+    if (!statusLine.startsWith("HTTP/1.1 101") && !statusLine.startsWith("HTTP/1.0 101")) {
+        Serial.printf("[CAMERA] WebSocket handshake failed: %s\n", statusLine.c_str());
+        cameraWebSocketClient.stop();
+        return false;
+    }
+
+    while (cameraWebSocketClient.connected()) {
+        const String header = readCameraWebSocketLine(3000);
+        if (header.length() == 0) {
+            break;
+        }
+    }
+
+    cameraWebSocketConnected = true;
+    Serial.println("[CAMERA] WebSocket connected");
+    return true;
+}
+
+bool sendCameraFrameWebSocket(camera_fb_t* frame) {
+    if (!CAMERA_USE_WEBSOCKET || !cameraWebSocketConnected || !cameraWebSocketClient.connected()) {
+        return false;
+    }
+
+    const uint64_t payloadLength = static_cast<uint64_t>(frame->len) + 4;
+    uint8_t header[14];
+    size_t headerLength = 0;
+    header[headerLength++] = 0x82;
+    if (payloadLength < 126) {
+        header[headerLength++] = 0x80 | static_cast<uint8_t>(payloadLength);
+    } else if (payloadLength <= 0xFFFF) {
+        header[headerLength++] = 0x80 | 126;
+        header[headerLength++] = static_cast<uint8_t>((payloadLength >> 8) & 0xFF);
+        header[headerLength++] = static_cast<uint8_t>(payloadLength & 0xFF);
+    } else {
+        header[headerLength++] = 0x80 | 127;
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            header[headerLength++] = static_cast<uint8_t>((payloadLength >> shift) & 0xFF);
+        }
+    }
+
+    uint8_t mask[4];
+    const uint32_t maskValue = esp_random();
+    mask[0] = static_cast<uint8_t>((maskValue >> 24) & 0xFF);
+    mask[1] = static_cast<uint8_t>((maskValue >> 16) & 0xFF);
+    mask[2] = static_cast<uint8_t>((maskValue >> 8) & 0xFF);
+    mask[3] = static_cast<uint8_t>(maskValue & 0xFF);
+    memcpy(header + headerLength, mask, sizeof(mask));
+    headerLength += sizeof(mask);
+
+    if (!writeCameraWebSocketBytes(header, headerLength)) {
+        cameraWebSocketClient.stop();
+        cameraWebSocketConnected = false;
+        return false;
+    }
+
+    uint8_t metadata[4] = {
+            static_cast<uint8_t>((frame->width >> 8) & 0xFF),
+            static_cast<uint8_t>(frame->width & 0xFF),
+            static_cast<uint8_t>((frame->height >> 8) & 0xFF),
+            static_cast<uint8_t>(frame->height & 0xFF),
+    };
+    for (size_t i = 0; i < sizeof(metadata); i++) {
+        metadata[i] ^= mask[i % 4];
+    }
+    if (!writeCameraWebSocketBytes(metadata, sizeof(metadata))) {
+        cameraWebSocketClient.stop();
+        cameraWebSocketConnected = false;
+        return false;
+    }
+
+    uint8_t chunk[1024];
+    size_t offset = 0;
+    while (offset < frame->len) {
+        const size_t count = min(sizeof(chunk), frame->len - offset);
+        for (size_t i = 0; i < count; i++) {
+            chunk[i] = frame->buf[offset + i] ^ mask[(offset + i + 4) % 4];
+        }
+        if (!writeCameraWebSocketBytes(chunk, count)) {
+            cameraWebSocketClient.stop();
+            cameraWebSocketConnected = false;
+            return false;
+        }
+        offset += count;
+    }
+
+    return true;
+}
+
+bool postCameraFrameHttp(camera_fb_t* frame) {
+    HTTPClient http;
+    const String url = buildApiUrl("/api/devices/") + deviceId + "/camera/frame";
+    if (!beginHttpClient(http, url)) {
+        Serial.printf("[CAMERA] POST %s begin failed\n", url.c_str());
+        return false;
+    }
+
+    addDeviceAuthHeader(http);
+    http.addHeader("Content-Type", "image/jpeg");
+    http.addHeader("X-Camera-Width", String(frame->width));
+    http.addHeader("X-Camera-Height", String(frame->height));
+
+    const int statusCode = http.POST(frame->buf, frame->len);
+    const String responseBody = http.getString();
+    http.end();
+
+    if (statusCode < 200 || statusCode >= 300) {
+        Serial.printf("[CAMERA] Frame upload failed. status=%d body=%s\n", statusCode, responseBody.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool uploadCameraFrame() {
+    if (!cameraReady || WiFi.status() != WL_CONNECTED || !deviceRegistered) {
+        return false;
+    }
+
+    camera_fb_t* frame = esp_camera_fb_get();
+    if (frame == nullptr) {
+        cameraReady = false;
+        cameraStatusDirty = true;
+        Serial.println("[CAMERA] Frame capture failed");
+        return false;
+    }
+
+    if (frame->format != PIXFORMAT_JPEG) {
+        esp_camera_fb_return(frame);
+        Serial.println("[CAMERA] Captured frame is not JPEG");
+        return false;
+    }
+
+    bool ok = false;
+    if (CAMERA_USE_WEBSOCKET) {
+        connectCameraWebSocket();
+        handleCameraWebSocket();
+        ok = sendCameraFrameWebSocket(frame);
+    }
+    if (!ok) {
+        const uint32_t now = millis();
+        if (CAMERA_USE_WEBSOCKET && now - lastCameraHttpFallbackAt < CAMERA_HTTP_FALLBACK_INTERVAL_MS) {
+            esp_camera_fb_return(frame);
+            lastCameraUploadAt = now;
+            return false;
+        }
+        lastCameraHttpFallbackAt = now;
+        ok = postCameraFrameHttp(frame);
+    }
+
+    esp_camera_fb_return(frame);
+
+    if (ok) {
+        lastCameraUploadAt = millis();
+    }
+    return ok;
+}
+#endif
 
 bool reportOtaStatus(const String& otaStatus, int progressPercent, const String& message) {
     if (WiFi.status() != WL_CONNECTED || !deviceRegistered) {
@@ -749,6 +1255,11 @@ void handleNetworkSync() {
             bootTelemetrySent = false;
             lastMqttConnected = false;
             mqttClient.disconnect();
+#ifdef BOARD_HAS_CAMERA
+            cameraWebSocketClient.stop();
+            cameraWebSocketConnected = false;
+            cameraWebSocketStarted = false;
+#endif
             Serial.println("[WIFI] Connection lost");
         } else {
             wifiReconnectedTelemetryPending = true;
@@ -820,6 +1331,20 @@ void handleNetworkSync() {
         }
     }
 
+#ifdef BOARD_HAS_CAMERA
+    if (CAMERA_USE_WEBSOCKET && cameraWebSocketStarted) {
+        handleCameraWebSocket();
+    }
+
+    if (deviceRegistered && (cameraStatusDirty || now - lastCameraStatusReportAt >= CAMERA_STATUS_RETRY_INTERVAL_MS)) {
+        reportCameraStatus(cameraReady ? "Camera ready" : "Camera unavailable");
+    }
+
+    if (deviceRegistered && cameraReady && now - lastCameraUploadAt >= CAMERA_UPLOAD_INTERVAL_MS) {
+        uploadCameraFrame();
+    }
+#endif
+
     if (now - lastCommandPollAt >= COMMAND_POLL_INTERVAL_MS) {
         lastCommandPollAt = now;
         pollPendingCommand();
@@ -847,6 +1372,10 @@ void setup() {
     Serial.printf("[BOOT] Free heap: %u bytes\n", ESP.getFreeHeap());
     Serial.printf("[BOOT] Device ID: %s\n", deviceId.c_str());
     Serial.printf("[AUTH] Device-specific API key: %s\n", deviceApiToken.isEmpty() ? "not provisioned" : "provisioned");
+
+#ifdef BOARD_HAS_CAMERA
+    initializeCamera();
+#endif
 
     if (!connectToWifi()) {
         Serial.println("[BOOT] Continuing without Wi-Fi. OTA and Home_IOT sync will retry later.");
