@@ -50,7 +50,7 @@
 #define CAMERA_HORIZONTAL_MIRROR false
 #endif
 #ifndef CAMERA_XCLK_FREQ_HZ
-#define CAMERA_XCLK_FREQ_HZ 12000000
+#define CAMERA_XCLK_FREQ_HZ 16000000
 #endif
 #ifndef CAMERA_PIN_PWDN
 #define CAMERA_PIN_PWDN -1
@@ -979,7 +979,7 @@ bool sendCameraFrameWebSocket(camera_fb_t* frame) {
         return false;
     }
 
-    uint8_t chunk[1024];
+    uint8_t chunk[4096];
     size_t offset = 0;
     while (offset < frame->len) {
         const size_t count = min(sizeof(chunk), frame->len - offset);
