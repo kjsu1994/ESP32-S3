@@ -206,6 +206,40 @@ Rendering pipeline follow-up:
 - `requestAnimationFrame` now draws only already-decoded frames, so render FPS should stay closer to source FPS.
 - Dropped frames now primarily mean either decode could not keep up with incoming frames or an already decoded frame was replaced before the next paint.
 
+## 2026-05-23 Raw JPEG / Quality 15 Test
+
+Added a raw latest-frame snapshot path:
+
+```text
+GET /api/cameras/{deviceId}/snapshot?token={streamToken}
+```
+
+This endpoint returns the latest backend-held JPEG bytes as `image/jpeg` without re-encoding. The client camera panel has a `Raw JPEG` button that opens this endpoint in a new tab. Use this to compare:
+
+- Raw JPEG at native `800x600`
+- Live canvas `Natural`
+- Live canvas `Sharp`
+- Live canvas `Detail`
+
+Firmware OTA test:
+
+```text
+CAMERA_JPEG_QUALITY 15
+```
+
+Observed backend results after settling:
+
+- Frame size increased from the q18 baseline around `22-23 KB` to about `25.5-26.0 KB`.
+- Backend ingest settled around `7.1-7.3 fps`.
+- Typical status: `captureMs=1`, `uploadMs=65-74`, `totalMs=67-75`, with one sample `captureMs=44`, `totalMs=109`.
+- Failures stayed `0/0`.
+
+Interpretation:
+
+- q15 is stable enough for visual inspection.
+- q15 costs some sustained FPS versus the q18 baseline.
+- Keep q15 temporarily while visually comparing the raw snapshot. Select q15 only if the visible quality gain is worth the FPS drop.
+
 Follow-up change:
 
 - Backend live interval was lowered from `75 ms` to `60 ms`.
