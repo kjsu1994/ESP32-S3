@@ -1,6 +1,6 @@
 # ESP32-S3 Camera Stream Recovery Notes
 
-Last updated: 2026-05-22
+Last updated: 2026-05-23
 
 ## Purpose
 
@@ -28,7 +28,7 @@ Current selected live profile:
 #define CAMERA_XCLK_FREQ_HZ 14000000
 
 // backend CameraService
-LIVE_UPLOAD_INTERVAL_MS = 75
+LIVE_UPLOAD_INTERVAL_MS = 60
 ```
 
 The camera driver is currently stable only after changing framebuffer allocation away from PSRAM:
@@ -53,10 +53,10 @@ camera ingest deviceId=esp32s3-2475F6A172E0 fps=4.00 frameBytes=5316 ageMs=0
 ping: 0% loss, min 3 ms, max 36 ms, average 6 ms
 ```
 
-The backend currently overrides the firmware default interval through camera control. The next target backend live interval is `75 ms`:
+The backend currently overrides the firmware default interval through camera control. The next target backend live interval is `60 ms`:
 
 ```text
-LIVE_UPLOAD_INTERVAL_MS = 75
+LIVE_UPLOAD_INTERVAL_MS = 60
 ```
 
 ## What Was Broken
@@ -119,6 +119,40 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 | OV5640 VGA, q15, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms | Recent settled sample: backend ingest avg 7.73 fps, frame size avg 16.3 KB, upload avg 45.5 ms/max 83 ms, total avg 49 ms/max 83 ms. Ping over 90 packets: 0% loss, min 2 ms, max 170 ms, avg 8 ms. | Stable, but not better enough than 60 ms. |
 | OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms | Confirmed `800x600`. Recent stable samples defended about 7.5-8.1 fps, with frame size often around 20-26 KB depending on scene. Typical status after settling showed capture 0-60 ms, upload 50-128 ms, total 59-161 ms, failures 0/0. Earlier 90-packet ping sample had 0% loss, min 2 ms, max 114 ms, avg 12 ms. | Selected current high-quality profile; SVGA increased resolution without collapsing FPS. |
 | OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms, schedule-from-start | FPS did not break past the same ceiling, while network health got worse: ping 1% loss, max 972 ms, avg 48 ms; upload max 1600 ms, total max 1600 ms. | Rejected and rolled back to finish-based scheduling. |
+
+## 2026-05-23 Web Client Rendering Iteration
+
+Firmware camera values were not changed in this iteration. The selected stream profile remained OV5640 `SVGA 800x600`, JPEG quality `18`, XCLK `14 MHz`, DRAM `fb_count=2`, `CAMERA_GRAB_WHEN_EMPTY`, backend live interval `75 ms`.
+
+Changes made on the web path:
+
+- Browser viewer now prefers `createImageBitmap(blob)` plus WebGL2/WebGL rendering.
+- Canvas2D remains the fallback path when GPU rendering is unavailable.
+- Viewer renders only the latest pending frame; stale pending frames are counted as dropped instead of being rendered late.
+- Viewer UI now reports source FPS, render FPS, decode time, draw time, renderer, GPU name when available, dropped frames, and frame size.
+- Backend viewer WebSocket now logs send-side metrics every 10 seconds.
+- The client has `Natural` and `Sharp` rendering presets. `Sharp` applies mild shader-based sharpening plus small contrast/saturation adjustment.
+
+Observed result after Docker rebuild/restart:
+
+```text
+camera viewer websocket sentFrames=77 overwrittenFrames=0 bytes=1706569 avgSendMs=1.08 maxSendMs=2.04 pending=false
+camera ingest fps=7.50 frameBytes=22185 listeners=1
+camera status size=800x600 captureMs=13 uploadMs=52 totalMs=65 intervalMs=75 frameBytes=22209 failures=0/0
+```
+
+Conclusion:
+
+- Server-to-browser WebSocket send was not the bottleneck in this sample.
+- The server sent roughly the same cadence it ingested, with no overwritten viewer frames and about `1 ms` average send time.
+- Further perceived quality improvements should be evaluated in the browser renderer first.
+- Further real FPS improvements still depend mostly on camera/upload cadence, not Java backend frame dispatch.
+
+Follow-up change:
+
+- Backend live interval was lowered from `75 ms` to `60 ms`.
+- Firmware did not need an OTA change because `CAMERA_MIN_UPLOAD_INTERVAL_MS` is `50 ms` and backend control already drives the live upload interval.
+- First post-change sample confirmed `intervalMs=60`: backend ingest stayed around `7.6 fps`, firmware status showed `captureMs=0-23`, `uploadMs=32-46`, `totalMs=32-69`, failures `0/0`, and viewer WebSocket had `sentFrames=76-78`, `overwrittenFrames=0`, `avgSendMs=1.28-1.32`.
 
 ## Backend Changes Added In This Iteration
 
@@ -187,7 +221,7 @@ The firmware polls this endpoint periodically and applies only upload interval /
 
 Short term:
 
-- Use the OV5640 target profile: SVGA 800x600, JPEG quality 18, 14 MHz, DRAM `fb_count=2`, `CAMERA_GRAB_WHEN_EMPTY`, backend `LIVE_UPLOAD_INTERVAL_MS 75`.
+- Use the OV5640 target profile: SVGA 800x600, JPEG quality 18, 14 MHz, DRAM `fb_count=2`, `CAMERA_GRAB_WHEN_EMPTY`, backend `LIVE_UPLOAD_INTERVAL_MS 60`.
 - Use the reported `applied_interval_ms` to verify that backend control values are actually applied.
 - Use OTA only for future firmware uploads while evaluating Wi-Fi load.
 - Keep DRAM framebuffer and `fb_count=2`.
@@ -220,7 +254,7 @@ Later:
    - `CAMERA_FRAME_SIZE FRAMESIZE_SVGA`
    - `CAMERA_JPEG_QUALITY 18`
    - `CAMERA_FB_COUNT 2`
-   - backend `LIVE_UPLOAD_INTERVAL_MS 75`
+   - backend `LIVE_UPLOAD_INTERVAL_MS 60`
    - `CAMERA_FB_IN_DRAM`
    - `CAMERA_GRAB_WHEN_EMPTY`
    - finish-based scheduling (`CAMERA_SCHEDULE_FROM_START false`)
