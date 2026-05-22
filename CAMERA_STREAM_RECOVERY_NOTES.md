@@ -19,8 +19,8 @@ Current selected live profile:
 
 ```cpp
 // include/config.defaults.h
-#define CAMERA_FRAME_SIZE FRAMESIZE_VGA
-#define CAMERA_JPEG_QUALITY 15
+#define CAMERA_FRAME_SIZE FRAMESIZE_SVGA
+#define CAMERA_JPEG_QUALITY 18
 #define CAMERA_FB_COUNT 2
 
 // include/boards/esp32s3_camera_ov5640.h
@@ -28,7 +28,7 @@ Current selected live profile:
 #define CAMERA_XCLK_FREQ_HZ 14000000
 
 // backend CameraService
-LIVE_UPLOAD_INTERVAL_MS = 60
+LIVE_UPLOAD_INTERVAL_MS = 75
 ```
 
 The camera driver is currently stable only after changing framebuffer allocation away from PSRAM:
@@ -117,6 +117,8 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 | OV5640 VGA, q15, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 55 ms | Recent settled sample: backend ingest avg 7.43 fps, frame size avg 16.6 KB, upload avg 97 ms/max 219 ms, total avg 119 ms/max 237 ms. Ping over 90 packets: 0% loss, min 2 ms, max 48 ms, avg 8 ms. | Rejected; worse latency than 60 ms without a useful FPS gain. |
 | OV5640 VGA, q15, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 60 ms | Settled sample: backend ingest avg 7.85 fps, frame size avg 17.7 KB, capture avg 18.6 ms, upload avg 37.4 ms/max 51 ms, total avg 56 ms/max 77 ms. Ping over 90 packets: 0% loss, min 2 ms, max 125 ms, avg 11 ms. | Selected current VGA quality/stability profile. |
 | OV5640 VGA, q15, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms | Recent settled sample: backend ingest avg 7.73 fps, frame size avg 16.3 KB, upload avg 45.5 ms/max 83 ms, total avg 49 ms/max 83 ms. Ping over 90 packets: 0% loss, min 2 ms, max 170 ms, avg 8 ms. | Stable, but not better enough than 60 ms. |
+| OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms | Confirmed `800x600`. Recent stable samples defended about 7.5-8.1 fps, with frame size often around 20-26 KB depending on scene. Typical status after settling showed capture 0-60 ms, upload 50-128 ms, total 59-161 ms, failures 0/0. Earlier 90-packet ping sample had 0% loss, min 2 ms, max 114 ms, avg 12 ms. | Selected current high-quality profile; SVGA increased resolution without collapsing FPS. |
+| OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms, schedule-from-start | FPS did not break past the same ceiling, while network health got worse: ping 1% loss, max 972 ms, avg 48 ms; upload max 1600 ms, total max 1600 ms. | Rejected and rolled back to finish-based scheduling. |
 
 ## Backend Changes Added In This Iteration
 
@@ -185,17 +187,19 @@ The firmware polls this endpoint periodically and applies only upload interval /
 
 Short term:
 
-- Use the OV5640 target profile: VGA 640x480, JPEG quality 15, 14 MHz, DRAM `fb_count=2`, `CAMERA_GRAB_WHEN_EMPTY`, backend `LIVE_UPLOAD_INTERVAL_MS 60`.
+- Use the OV5640 target profile: SVGA 800x600, JPEG quality 18, 14 MHz, DRAM `fb_count=2`, `CAMERA_GRAB_WHEN_EMPTY`, backend `LIVE_UPLOAD_INTERVAL_MS 75`.
 - Use the reported `applied_interval_ms` to verify that backend control values are actually applied.
 - Use OTA only for future firmware uploads while evaluating Wi-Fi load.
 - Keep DRAM framebuffer and `fb_count=2`.
 - Keep the capture recovery code unless it causes a new failure. It gives clear logs and avoids permanent black-screen states after transient camera driver failures.
+- Keep `CAMERA_SCHEDULE_FROM_START` disabled. It increased network jitter on SVGA without improving FPS.
+- The frontend canvas now draws at display size times device pixel ratio and applies a small contrast/saturation boost, so browser scaling should not hide the extra SVGA detail.
 - Measure actual `upload_ms` under three conditions:
   - no browser viewer
   - one browser viewer on local LAN
   - one viewer through public route
 - Verify whether control endpoint changes the interval between `IDLE` and `LIVE` as expected.
-- If FPS is more important than latency spikes, retest backend `LIVE_UPLOAD_INTERVAL_MS 50` over a longer window before promoting it.
+- If FPS becomes more important than image quality, compare against the previous VGA/q15/60 ms profile before changing transport logic.
 
 Medium term:
 
@@ -213,12 +217,13 @@ Later:
 
 1. Start from the current baseline:
    - `CAMERA_XCLK_FREQ_HZ 14000000`
-   - `CAMERA_FRAME_SIZE FRAMESIZE_VGA`
-   - `CAMERA_JPEG_QUALITY 15`
+   - `CAMERA_FRAME_SIZE FRAMESIZE_SVGA`
+   - `CAMERA_JPEG_QUALITY 18`
    - `CAMERA_FB_COUNT 2`
-   - backend `LIVE_UPLOAD_INTERVAL_MS 60`
+   - backend `LIVE_UPLOAD_INTERVAL_MS 75`
    - `CAMERA_FB_IN_DRAM`
    - `CAMERA_GRAB_WHEN_EMPTY`
+   - finish-based scheduling (`CAMERA_SCHEDULE_FROM_START false`)
 2. Upload firmware through OTA only:
    - `pio run -c platformio.local.ini -e esp32s3-cam-livingroom-ota -t upload`
 3. Open the web page so backend control returns `LIVE`.
