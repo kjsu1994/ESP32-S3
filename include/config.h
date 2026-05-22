@@ -10,7 +10,7 @@
 #endif
 
 #ifdef BOARD_HAS_CAMERA
-#include "boards/esp32s3_camera_ov2640.h"
+#include "boards/esp32s3_camera_ov5640.h"
 #else
 #include "boards/esp32s3_devkitc.h"
 #endif

@@ -15,16 +15,20 @@ This note records the current camera streaming state, what was tested, what actu
 
 ## Current Working Baseline
 
-Selected live-stream profile:
+Current target profile for the next OTA test:
 
 ```cpp
 // include/config.defaults.h
-#define CAMERA_UPLOAD_INTERVAL_MS 100
-#define CAMERA_FRAME_SIZE FRAMESIZE_QVGA
-#define CAMERA_JPEG_QUALITY 20
+#define CAMERA_FRAME_SIZE FRAMESIZE_HVGA
+#define CAMERA_JPEG_QUALITY 32
+#define CAMERA_FB_COUNT 2
 
-// include/boards/esp32s3_camera_ov2640.h
+// include/boards/esp32s3_camera_ov5640.h
+#define CAMERA_SENSOR_NAME "OV5640"
 #define CAMERA_XCLK_FREQ_HZ 14000000
+
+// backend CameraService
+LIVE_UPLOAD_INTERVAL_MS = 75
 ```
 
 The camera driver is currently stable only after changing framebuffer allocation away from PSRAM:
@@ -41,7 +45,7 @@ The previous recovery baseline remains useful when isolating camera driver failu
 [CAMERA] Self-test ok label=boot size=640x480 bytes=13336 elapsed_ms=292 format=4 heap=237464
 ```
 
-The current selected live profile was measured through the backend/viewer path after USB was disconnected:
+The previous selected live profile was measured through the backend/viewer path after USB was disconnected:
 
 ```text
 viewer_result frames=265 fps=4.07 avg_bytes=5327 total_bytes=1411730 timeouts=0
@@ -49,10 +53,10 @@ camera ingest deviceId=esp32s3-2475F6A172E0 fps=4.00 frameBytes=5316 ageMs=0
 ping: 0% loss, min 3 ms, max 36 ms, average 6 ms
 ```
 
-The backend currently overrides the firmware default interval through camera control. The selected backend live interval is `100 ms`:
+The backend currently overrides the firmware default interval through camera control. The next target backend live interval is `75 ms`:
 
 ```text
-LIVE_UPLOAD_INTERVAL_MS = 100
+LIVE_UPLOAD_INTERVAL_MS = 75
 ```
 
 ## What Was Broken
@@ -86,7 +90,7 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 - The recovery path works at VGA, 12 MHz, JPEG quality 28.
 - The selected live path works better at QVGA, JPEG quality 20, 14 MHz.
 - With QVGA at 14 MHz, lowering JPEG quality from `24` to `32` did not meaningfully improve FPS, and raising quality from `24` to `20` kept roughly the same FPS, so `20` is preferred for image quality.
-- Lowering backend live interval from `100 ms` to `50 ms` made streaming worse: viewer FPS dropped around `0.26-0.34`, backend ingest stayed around `0.3 fps`, and ping loss returned. Keep `100 ms`.
+- The previous `50 ms` backend test was misleading: firmware rejected `upload_interval_ms < 100`, so the requested value was not actually applied. The firmware now accepts/clamps intervals through `CAMERA_MIN_UPLOAD_INTERVAL_MS` and reports the applied interval in camera status.
 - The bottleneck moves by profile: VGA was upload/network bound; QVGA/14 MHz is closer to camera frame cadence plus the backend live interval.
 - Ping to the board can spike heavily while streaming, which supports the network/upload bottleneck diagnosis.
 - Ping during the last successful 12 MHz run had `0%` packet loss but large jitter: min `10 ms`, max `785 ms`, average `161 ms`.
@@ -103,6 +107,8 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 | QVGA, q24, 14 MHz, backend 100 ms | Viewer result: 258 frames, 3.97 fps, average 4336 bytes; backend ingest 4.0-4.4 fps; ping 0% loss, avg 13 ms. | Good fallback. |
 | QVGA, q20, 14 MHz, backend 100 ms | Viewer result: 265 frames, 4.07 fps, average 5327 bytes; backend ingest 4.0-4.1 fps; ping 0% loss, avg 6 ms. | Selected current profile. |
 | QVGA, q24, 14 MHz, backend 50 ms | Control returned LIVE/50, but ingest stayed around 0.3 fps and ping degraded to 16% loss. | Rejected. |
+| OV5640 HVGA, q32, 14 MHz, backend 75 ms, async server ingest | Backend ingest 4.5 fps, frame size about 6.7-7.0 KB. Firmware status: capture 131 ms, upload 8-9 ms, total 139-140 ms, applied interval 75 ms. Server metrics: copy 9 us, queue 121 us, accept 210 us, notify 71 us. Ping 0% loss, avg 5 ms. | Server/client processing is not the current FPS bottleneck. Next target is camera capture wait and scheduler. |
+| OV5640 HVGA, q32, 14 MHz, backend 75 ms, fb_count=2, async server ingest | Backend ingest reached 9.1 fps, frame size about 6.7-6.8 KB. Firmware status: capture 24 ms, upload 9 ms, total 33 ms, applied interval 75 ms. Server metrics: copy 13 us, queue 78 us, accept 128 us, notify 58 us. Ping 0% loss, avg 7 ms. | Selected current 9-10 fps target profile. |
 
 ## Backend Changes Added In This Iteration
 
@@ -171,8 +177,8 @@ The firmware polls this endpoint periodically and applies only upload interval /
 
 Short term:
 
-- Keep QVGA, JPEG quality 20, 14 MHz for live use.
-- Keep backend `LIVE_UPLOAD_INTERVAL_MS` at `100 ms`; do not use `50 ms` unless doing an isolated saturation test.
+- Use the OV5640 target profile: HVGA 480x320, JPEG quality 32, 14 MHz, DRAM `fb_count=2`, backend `LIVE_UPLOAD_INTERVAL_MS 75`.
+- Use the reported `applied_interval_ms` to verify that backend control values are actually applied.
 - Use OTA only for future firmware uploads while evaluating Wi-Fi load.
 - Keep DRAM framebuffer and `fb_count=1`.
 - Keep the capture recovery code unless it causes a new failure. It gives clear logs and avoids permanent black-screen states after transient camera driver failures.
@@ -199,11 +205,11 @@ Later:
 
 1. Start from the current baseline:
    - `CAMERA_XCLK_FREQ_HZ 14000000`
-   - `CAMERA_FRAME_SIZE FRAMESIZE_QVGA`
-   - `CAMERA_JPEG_QUALITY 20`
-   - backend `LIVE_UPLOAD_INTERVAL_MS 100`
+   - `CAMERA_FRAME_SIZE FRAMESIZE_HVGA`
+   - `CAMERA_JPEG_QUALITY 32`
+   - `CAMERA_FB_COUNT 2`
+   - backend `LIVE_UPLOAD_INTERVAL_MS 75`
    - `CAMERA_FB_IN_DRAM`
-   - `fb_count=1`
    - `CAMERA_GRAB_WHEN_EMPTY`
 2. Upload firmware through OTA only:
    - `pio run -c platformio.local.ini -e esp32s3-cam-livingroom-ota -t upload`
@@ -213,7 +219,9 @@ Later:
    - `Frame ok=true`
    - `capture_ms`
    - `upload_ms`
+   - `total_ms`
    - `interval_ms`
+   - `applied_interval_ms`
 5. Check backend logs for `camera ingest` fps and `frameBytes`.
 6. Run ping to `192.168.123.120` while streaming to measure jitter.
 7. If self-test fails, do not touch backend/frontend. Stay in camera init/XCLK/framebuffer/power debugging.

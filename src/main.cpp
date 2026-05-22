@@ -87,9 +87,17 @@ uint32_t lastCameraHttpFallbackAt = 0;
 uint32_t lastCameraControlPollAt = 0;
 uint32_t lastCameraDiagnosticsLogAt = 0;
 uint32_t lastCameraRecoveryAt = 0;
+uint32_t lastCameraUploadStartedAt = 0;
 uint32_t currentCameraUploadIntervalMs = CAMERA_IDLE_UPLOAD_INTERVAL_MS;
 uint32_t cameraCaptureFailureCount = 0;
 uint32_t cameraUploadFailureCount = 0;
+uint32_t lastCameraCaptureMs = 0;
+uint32_t lastCameraUploadMs = 0;
+uint32_t lastCameraTotalMs = 0;
+uint32_t lastCameraFrameBytes = 0;
+uint16_t lastCameraFrameWidth = 0;
+uint16_t lastCameraFrameHeight = 0;
+uint16_t detectedCameraSensorPid = 0;
 #endif
 
 LedMode ledMode = LedMode::STATUS;
@@ -129,6 +137,12 @@ const char* ledModeToString(LedMode mode) {
 String boolToJson(bool value) {
     return value ? "true" : "false";
 }
+
+#ifdef BOARD_HAS_CAMERA
+String numberOrNull(uint32_t value) {
+    return value == 0 ? String("null") : String(value);
+}
+#endif
 
 const char* effectiveDeviceType() {
 #ifdef BOARD_HAS_CAMERA
@@ -566,10 +580,10 @@ bool initializeCamera() {
     config.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
     config.frame_size = CAMERA_FRAME_SIZE;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.grab_mode = CAMERA_GRAB_MODE;
+    config.fb_location = CAMERA_FB_LOCATION;
     config.jpeg_quality = CAMERA_JPEG_QUALITY;
-    config.fb_count = 1;
+    config.fb_count = CAMERA_FB_COUNT;
 
     const esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
@@ -581,6 +595,17 @@ bool initializeCamera() {
 
     sensor_t* sensor = esp_camera_sensor_get();
     if (sensor != nullptr) {
+        detectedCameraSensorPid = sensor->id.PID;
+        if (CAMERA_EXPECTED_SENSOR_PID != 0 && detectedCameraSensorPid != CAMERA_EXPECTED_SENSOR_PID) {
+            Serial.printf("[CAMERA] Sensor mismatch expected=%s/0x%04x actual=0x%04x\n",
+                          CAMERA_SENSOR_NAME,
+                          CAMERA_EXPECTED_SENSOR_PID,
+                          detectedCameraSensorPid);
+        } else {
+            Serial.printf("[CAMERA] Sensor detected name=%s pid=0x%04x\n",
+                          CAMERA_SENSOR_NAME,
+                          detectedCameraSensorPid);
+        }
         sensor->set_framesize(sensor, CAMERA_FRAME_SIZE);
         sensor->set_quality(sensor, CAMERA_JPEG_QUALITY);
         sensor->set_vflip(sensor, CAMERA_VERTICAL_FLIP ? 1 : 0);
@@ -675,6 +700,19 @@ bool reportCameraStatus(const String& message) {
 
     const String payload =
             String("{\"camera_ready\":") + boolToJson(cameraReady) +
+            ",\"width\":" + numberOrNull(lastCameraFrameWidth) +
+            ",\"height\":" + numberOrNull(lastCameraFrameHeight) +
+            ",\"capture_ms\":" + String(lastCameraCaptureMs) +
+            ",\"upload_ms\":" + String(lastCameraUploadMs) +
+            ",\"total_ms\":" + String(lastCameraTotalMs) +
+            ",\"firmware_frame_bytes\":" + String(lastCameraFrameBytes) +
+            ",\"applied_interval_ms\":" + String(currentCameraUploadIntervalMs) +
+            ",\"capture_failures\":" + String(cameraCaptureFailureCount) +
+            ",\"upload_failures\":" + String(cameraUploadFailureCount) +
+            ",\"camera_streaming\":" + boolToJson(cameraStreamingEnabled) +
+            ",\"camera_control_received\":" + boolToJson(cameraControlReceived) +
+            ",\"sensor_name\":\"" + escapeJson(CAMERA_SENSOR_NAME) + "\"" +
+            ",\"sensor_pid\":" + String(detectedCameraSensorPid) +
             ",\"message\":\"" + escapeJson(message) + "\"}";
 
     const bool ok = postJson(buildApiUrl("/api/devices/") + deviceId + "/camera/status", payload);
@@ -693,18 +731,30 @@ void applyCameraControl(const String& payload) {
     const uint32_t previousInterval = currentCameraUploadIntervalMs;
     const bool previousStreamingEnabled = cameraStreamingEnabled;
 
-    if (interval >= 100 && interval <= 10000) {
-        currentCameraUploadIntervalMs = static_cast<uint32_t>(interval);
+    bool intervalClamped = false;
+    if (interval > 0) {
+        uint32_t nextInterval = static_cast<uint32_t>(interval);
+        if (nextInterval < CAMERA_MIN_UPLOAD_INTERVAL_MS) {
+            nextInterval = CAMERA_MIN_UPLOAD_INTERVAL_MS;
+            intervalClamped = true;
+        } else if (nextInterval > CAMERA_MAX_UPLOAD_INTERVAL_MS) {
+            nextInterval = CAMERA_MAX_UPLOAD_INTERVAL_MS;
+            intervalClamped = true;
+        }
+        currentCameraUploadIntervalMs = nextInterval;
     }
     cameraStreamingEnabled = nextStreamingEnabled;
     cameraControlReceived = true;
 
-    if (previousInterval != currentCameraUploadIntervalMs || previousStreamingEnabled != cameraStreamingEnabled) {
-        Serial.printf("[CAMERA] Control mode=%s viewers=%ld interval=%lu streaming=%s\n",
+    if (previousInterval != currentCameraUploadIntervalMs || previousStreamingEnabled != cameraStreamingEnabled || intervalClamped) {
+        cameraStatusDirty = true;
+        Serial.printf("[CAMERA] Control mode=%s viewers=%ld requested_interval=%ld interval=%lu streaming=%s clamped=%s\n",
                       mode.isEmpty() ? "UNKNOWN" : mode.c_str(),
                       viewerCount,
+                      interval,
                       static_cast<unsigned long>(currentCameraUploadIntervalMs),
-                      cameraStreamingEnabled ? "on" : "off");
+                      cameraStreamingEnabled ? "on" : "off",
+                      intervalClamped ? "true" : "false");
     }
 }
 
@@ -991,15 +1041,22 @@ bool uploadCameraFrame() {
         return false;
     }
     if (!cameraStreamingEnabled) {
-        lastCameraUploadAt = millis();
+        const uint32_t now = millis();
+        lastCameraUploadAt = now;
+        lastCameraUploadStartedAt = now;
         return false;
     }
 
     const uint32_t startedAt = millis();
+    lastCameraUploadStartedAt = startedAt;
     const uint32_t captureStartedAt = startedAt;
     camera_fb_t* frame = esp_camera_fb_get();
+    const uint32_t capturedAt = millis();
     if (frame == nullptr) {
         cameraCaptureFailureCount++;
+        lastCameraCaptureMs = capturedAt - captureStartedAt;
+        lastCameraUploadMs = 0;
+        lastCameraTotalMs = capturedAt - startedAt;
         if (cameraCaptureFailureCount == 1) {
             cameraStatusDirty = true;
         }
@@ -1008,20 +1065,21 @@ bool uploadCameraFrame() {
         if (cameraCaptureFailureCount >= CAMERA_CAPTURE_RECOVERY_FAILURES) {
             recoverCamera("capture-fail");
         }
-        lastCameraUploadAt = millis();
+        lastCameraUploadAt = capturedAt;
         return false;
     }
     cameraCaptureFailureCount = 0;
-    const uint32_t capturedAt = millis();
 
     if (frame->format != PIXFORMAT_JPEG) {
         esp_camera_fb_return(frame);
         Serial.println("[CAMERA] Captured frame is not JPEG");
+        lastCameraUploadAt = millis();
         return false;
     }
 
     bool ok = false;
     bool triedHttp = false;
+    bool skippedHttpFallback = false;
     if (CAMERA_USE_WEBSOCKET) {
         connectCameraWebSocket();
         handleCameraWebSocket();
@@ -1030,13 +1088,12 @@ bool uploadCameraFrame() {
     if (!ok) {
         const uint32_t now = millis();
         if (CAMERA_USE_WEBSOCKET && (!CAMERA_HTTP_FALLBACK_ENABLED || now - lastCameraHttpFallbackAt < CAMERA_HTTP_FALLBACK_INTERVAL_MS)) {
-            esp_camera_fb_return(frame);
-            lastCameraUploadAt = now;
-            return false;
+            skippedHttpFallback = true;
+        } else {
+            lastCameraHttpFallbackAt = now;
+            triedHttp = true;
+            ok = postCameraFrameHttp(frame);
         }
-        lastCameraHttpFallbackAt = now;
-        triedHttp = true;
-        ok = postCameraFrameHttp(frame);
     }
 
     const size_t frameLength = frame->len;
@@ -1053,11 +1110,18 @@ bool uploadCameraFrame() {
     }
 
     const uint32_t finishedAt = millis();
+    lastCameraCaptureMs = capturedAt - captureStartedAt;
+    lastCameraUploadMs = finishedAt - capturedAt;
+    lastCameraTotalMs = finishedAt - startedAt;
+    lastCameraFrameBytes = frameLength;
+    lastCameraFrameWidth = frameWidth;
+    lastCameraFrameHeight = frameHeight;
+
     if (finishedAt - lastCameraDiagnosticsLogAt >= CAMERA_DIAGNOSTICS_LOG_INTERVAL_MS) {
         lastCameraDiagnosticsLogAt = finishedAt;
         Serial.printf("[CAMERA] Frame ok=%s transport=%s size=%ux%u bytes=%u capture_ms=%lu upload_ms=%lu total_ms=%lu interval_ms=%lu upload_failures=%lu heap=%u\n",
                       ok ? "true" : "false",
-                      triedHttp ? "http" : "websocket",
+                      triedHttp ? "http" : (skippedHttpFallback ? "websocket-no-fallback" : "websocket"),
                       frameWidth,
                       frameHeight,
                       static_cast<unsigned int>(frameLength),
@@ -1067,6 +1131,10 @@ bool uploadCameraFrame() {
                       static_cast<unsigned long>(currentCameraUploadIntervalMs),
                       static_cast<unsigned long>(cameraUploadFailureCount),
                       ESP.getFreeHeap());
+    }
+    cameraStatusDirty = true;
+    if (CAMERA_SCHEDULE_FROM_START && CAMERA_MIN_POST_UPLOAD_YIELD_MS > 0) {
+        delay(CAMERA_MIN_POST_UPLOAD_YIELD_MS);
     }
     return ok;
 }
@@ -1445,7 +1513,8 @@ void handleNetworkSync() {
         pollCameraControl();
     }
 
-    if (deviceRegistered && cameraReady && cameraControlReceived && now - lastCameraUploadAt >= currentCameraUploadIntervalMs) {
+    const uint32_t cameraScheduleReference = CAMERA_SCHEDULE_FROM_START ? lastCameraUploadStartedAt : lastCameraUploadAt;
+    if (deviceRegistered && cameraReady && cameraControlReceived && now - cameraScheduleReference >= currentCameraUploadIntervalMs) {
         uploadCameraFrame();
     }
 #endif
