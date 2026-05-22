@@ -170,7 +170,7 @@ The test: Every changed line should trace directly to the user's request.
 
 - 검은 화면을 바로 프론트엔드 문제로 보지 않는다. 먼저 시리얼 로그의 `Self-test ok`, `Frame ok=true`, 백엔드의 `camera ingest` 순서로 확인한다.
 - 카메라 설정은 한 번에 하나만 바꾼다. `frame_size`, `jpeg_quality`, `xclk`, `fb_location`, `fb_count`, `grab_mode`를 동시에 바꾸지 않는다.
-- 현재 확인된 안정 기준은 `VGA`, `JPEG quality 28`, `XCLK 16 MHz`, `CAMERA_FB_IN_DRAM`, `fb_count=1`, `CAMERA_GRAB_WHEN_EMPTY`이다.
+- 현재 복구용 안정 기준은 `VGA`, `JPEG quality 28`, `XCLK 12 MHz`, `CAMERA_FB_IN_DRAM`, `fb_count=1`, `CAMERA_GRAB_WHEN_EMPTY`이다. 현재 선택된 라이브 성능 기준은 `QVGA`, `JPEG quality 20`, `XCLK 14 MHz`, 백엔드 `LIVE_UPLOAD_INTERVAL_MS 100`이다. 2026-05-22 테스트에서 `XCLK 16 MHz`는 부팅 self-test 실패를 재현했고, 백엔드 live interval `50 ms`는 Wi-Fi/업로드 포화를 재현했다.
 - `CAMERA_FB_IN_PSRAM` 재도입은 별도 실험으로만 한다. 이전 증상은 부팅 직후 `esp_camera_fb_get()` 실패였고, DRAM framebuffer로 회복됐다.
 - `cameraReady=false`를 1회 캡처 실패에 바로 설정하지 않는다. 일시 실패와 드라이버 실패를 로그로 구분한다.
 - 성능 문제를 볼 때는 `capture_ms`와 `upload_ms`를 분리한다. 현재 병목은 카메라 캡처보다 WebSocket/Wi-Fi 업로드 쪽으로 관측됐다.

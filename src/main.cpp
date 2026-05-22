@@ -22,6 +22,9 @@
 #ifndef CAMERA_UPLOAD_INTERVAL_MS
 #define CAMERA_UPLOAD_INTERVAL_MS 1000
 #endif
+#ifndef CAMERA_IDLE_UPLOAD_INTERVAL_MS
+#define CAMERA_IDLE_UPLOAD_INTERVAL_MS 3000
+#endif
 #ifndef CAMERA_HTTP_FALLBACK_INTERVAL_MS
 #define CAMERA_HTTP_FALLBACK_INTERVAL_MS 5000
 #endif
@@ -37,6 +40,9 @@
 #ifndef CAMERA_WEBSOCKET_RECONNECT_INTERVAL_MS
 #define CAMERA_WEBSOCKET_RECONNECT_INTERVAL_MS 5000
 #endif
+#ifndef CAMERA_WEBSOCKET_HANDSHAKE_TIMEOUT_MS
+#define CAMERA_WEBSOCKET_HANDSHAKE_TIMEOUT_MS 8000
+#endif
 #ifndef CAMERA_FRAME_SIZE
 #define CAMERA_FRAME_SIZE FRAMESIZE_QVGA
 #endif
@@ -51,6 +57,12 @@
 #endif
 #ifndef CAMERA_XCLK_FREQ_HZ
 #define CAMERA_XCLK_FREQ_HZ 16000000
+#endif
+#ifndef CAMERA_CAPTURE_RECOVERY_FAILURES
+#define CAMERA_CAPTURE_RECOVERY_FAILURES 5
+#endif
+#ifndef CAMERA_CAPTURE_RECOVERY_COOLDOWN_MS
+#define CAMERA_CAPTURE_RECOVERY_COOLDOWN_MS 10000
 #endif
 #ifndef CAMERA_PIN_PWDN
 #define CAMERA_PIN_PWDN -1
@@ -116,8 +128,10 @@ constexpr uint32_t WIFI_RETRY_DELAY_MS = 500;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
 constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 constexpr uint32_t HEALTH_REPORT_INTERVAL_MS = 30000;
+constexpr uint32_t STATE_REPORT_RETRY_INTERVAL_MS = 5000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t TELEMETRY_REPORT_INTERVAL_MS = 60000;
+constexpr uint32_t TELEMETRY_RETRY_INTERVAL_MS = 5000;
 constexpr uint32_t TLS_TIME_SYNC_TIMEOUT_MS = 10000;
 #ifdef BOARD_HAS_CAMERA
 constexpr uint32_t CAMERA_STATUS_RETRY_INTERVAL_MS = 10000;
@@ -157,6 +171,7 @@ bool cameraStatusDirty = true;
 bool cameraWebSocketStarted = false;
 bool cameraWebSocketConnected = false;
 bool cameraStreamingEnabled = true;
+bool cameraControlReceived = false;
 #endif
 int lastOtaProgressPercent = -1;
 
@@ -166,14 +181,18 @@ uint32_t lastMqttReconnectAttemptAt = 0;
 uint32_t rebootRequestedAt = 0;
 uint32_t lastCommandPollAt = 0;
 uint32_t lastTelemetryReportAt = 0;
+uint32_t lastTelemetryAttemptAt = 0;
+uint32_t lastStateReportAttemptAt = 0;
 #ifdef BOARD_HAS_CAMERA
 uint32_t lastCameraUploadAt = 0;
 uint32_t lastCameraStatusReportAt = 0;
+uint32_t lastCameraStatusAttemptAt = 0;
 uint32_t lastCameraWebSocketReconnectAt = 0;
 uint32_t lastCameraHttpFallbackAt = 0;
 uint32_t lastCameraControlPollAt = 0;
 uint32_t lastCameraDiagnosticsLogAt = 0;
-uint32_t currentCameraUploadIntervalMs = CAMERA_UPLOAD_INTERVAL_MS;
+uint32_t lastCameraRecoveryAt = 0;
+uint32_t currentCameraUploadIntervalMs = CAMERA_IDLE_UPLOAD_INTERVAL_MS;
 uint32_t cameraCaptureFailureCount = 0;
 uint32_t cameraUploadFailureCount = 0;
 #endif
@@ -564,6 +583,8 @@ bool reportHealth() {
         return false;
     }
 
+    lastHealthReportAt = millis();
+
     if (!deviceRegistered && !registerDevice()) {
         return false;
     }
@@ -575,9 +596,6 @@ bool reportHealth() {
             "}";
 
     const bool ok = postJson(buildApiUrl("/api/devices/") + deviceId + "/health", payload);
-    if (ok) {
-        lastHealthReportAt = millis();
-    }
     return ok;
 }
 
@@ -610,6 +628,12 @@ bool reportTelemetry(const String& eventType, const String& payloadJson) {
     if (WiFi.status() != WL_CONNECTED) {
         return false;
     }
+
+    const uint32_t now = millis();
+    if (now - lastTelemetryAttemptAt < TELEMETRY_RETRY_INTERVAL_MS) {
+        return false;
+    }
+    lastTelemetryAttemptAt = now;
 
     if (!deviceRegistered && !registerDevice()) {
         return false;
@@ -674,10 +698,10 @@ bool initializeCamera() {
     return true;
 }
 
-void runCameraSelfTest(const char* label) {
+bool runCameraSelfTest(const char* label) {
     if (!cameraReady) {
         Serial.printf("[CAMERA] Self-test skipped label=%s ready=false\n", label);
-        return;
+        return false;
     }
 
     const uint32_t startedAt = millis();
@@ -689,7 +713,7 @@ void runCameraSelfTest(const char* label) {
                       static_cast<unsigned long>(elapsed),
                       ESP.getFreeHeap(),
                       psramFound() ? "yes" : "no");
-        return;
+        return false;
     }
 
     Serial.printf("[CAMERA] Self-test ok label=%s size=%ux%u bytes=%u elapsed_ms=%lu format=%d heap=%u\n",
@@ -701,12 +725,58 @@ void runCameraSelfTest(const char* label) {
                   static_cast<int>(frame->format),
                   ESP.getFreeHeap());
     esp_camera_fb_return(frame);
+    return true;
+}
+
+bool recoverCamera(const char* reason) {
+    const uint32_t now = millis();
+    if (lastCameraRecoveryAt != 0 && now - lastCameraRecoveryAt < CAMERA_CAPTURE_RECOVERY_COOLDOWN_MS) {
+        return false;
+    }
+    lastCameraRecoveryAt = now;
+
+    Serial.printf("[CAMERA] Recovery start reason=%s failures=%lu heap=%u\n",
+                  reason,
+                  static_cast<unsigned long>(cameraCaptureFailureCount),
+                  ESP.getFreeHeap());
+
+    if (cameraWebSocketConnected) {
+        cameraWebSocketClient.stop();
+        cameraWebSocketConnected = false;
+    }
+
+    if (cameraReady) {
+        esp_camera_deinit();
+        cameraReady = false;
+        delay(200);
+    }
+
+    const bool initialized = initializeCamera();
+    if (!initialized) {
+        cameraStatusDirty = true;
+        Serial.printf("[CAMERA] Recovery init failed reason=%s\n", reason);
+        return false;
+    }
+
+    delay(200);
+    const bool selfTestOk = runCameraSelfTest(reason);
+    if (selfTestOk) {
+        cameraCaptureFailureCount = 0;
+        cameraStatusDirty = true;
+        Serial.printf("[CAMERA] Recovery ok reason=%s\n", reason);
+        return true;
+    }
+
+    cameraStatusDirty = true;
+    Serial.printf("[CAMERA] Recovery self-test failed reason=%s\n", reason);
+    return false;
 }
 
 bool reportCameraStatus(const String& message) {
     if (WiFi.status() != WL_CONNECTED || !deviceRegistered) {
         return false;
     }
+    lastCameraStatusAttemptAt = millis();
 
     const String payload =
             String("{\"camera_ready\":") + boolToJson(cameraReady) +
@@ -732,6 +802,7 @@ void applyCameraControl(const String& payload) {
         currentCameraUploadIntervalMs = static_cast<uint32_t>(interval);
     }
     cameraStreamingEnabled = nextStreamingEnabled;
+    cameraControlReceived = true;
 
     if (previousInterval != currentCameraUploadIntervalMs || previousStreamingEnabled != cameraStreamingEnabled) {
         Serial.printf("[CAMERA] Control mode=%s viewers=%ld interval=%lu streaming=%s\n",
@@ -746,6 +817,7 @@ void pollCameraControl() {
     if (WiFi.status() != WL_CONNECTED || !deviceRegistered) {
         return;
     }
+    lastCameraControlPollAt = millis();
 
     String responseBody;
     const String url = buildApiUrl("/api/devices/") + deviceId + "/camera/control";
@@ -754,7 +826,6 @@ void pollCameraControl() {
     }
 
     applyCameraControl(responseBody);
-    lastCameraControlPollAt = millis();
 }
 
 String base64EncodeBytes(const uint8_t* data, size_t length) {
@@ -885,11 +956,12 @@ bool connectCameraWebSocket() {
 
     cameraWebSocketConnected = false;
     cameraWebSocketClient.stop();
-    cameraWebSocketClient.setTimeout(2000);
+    cameraWebSocketClient.setTimeout(CAMERA_WEBSOCKET_HANDSHAKE_TIMEOUT_MS);
     if (!cameraWebSocketClient.connect(HOME_IOT_SERVER_HOST, HOME_IOT_SERVER_PORT)) {
         Serial.println("[CAMERA] WebSocket TCP connect failed");
         return false;
     }
+    cameraWebSocketClient.setNoDelay(true);
 
     const String webSocketKey = buildWebSocketKey();
     if (webSocketKey.isEmpty()) {
@@ -908,7 +980,7 @@ bool connectCameraWebSocket() {
     }
     cameraWebSocketClient.print("\r\n");
 
-    const String statusLine = readCameraWebSocketLine(3000);
+    const String statusLine = readCameraWebSocketLine(CAMERA_WEBSOCKET_HANDSHAKE_TIMEOUT_MS);
     if (!statusLine.startsWith("HTTP/1.1 101") && !statusLine.startsWith("HTTP/1.0 101")) {
         Serial.printf("[CAMERA] WebSocket handshake failed: %s\n", statusLine.c_str());
         cameraWebSocketClient.stop();
@@ -916,7 +988,7 @@ bool connectCameraWebSocket() {
     }
 
     while (cameraWebSocketClient.connected()) {
-        const String header = readCameraWebSocketLine(3000);
+        const String header = readCameraWebSocketLine(CAMERA_WEBSOCKET_HANDSHAKE_TIMEOUT_MS);
         if (header.length() == 0) {
             break;
         }
@@ -933,7 +1005,7 @@ bool sendCameraFrameWebSocket(camera_fb_t* frame) {
     }
 
     const uint64_t payloadLength = static_cast<uint64_t>(frame->len) + 4;
-    uint8_t header[14];
+    uint8_t header[18];
     size_t headerLength = 0;
     header[headerLength++] = 0x82;
     if (payloadLength < 126) {
@@ -958,12 +1030,6 @@ bool sendCameraFrameWebSocket(camera_fb_t* frame) {
     memcpy(header + headerLength, mask, sizeof(mask));
     headerLength += sizeof(mask);
 
-    if (!writeCameraWebSocketBytes(header, headerLength)) {
-        cameraWebSocketClient.stop();
-        cameraWebSocketConnected = false;
-        return false;
-    }
-
     uint8_t metadata[4] = {
             static_cast<uint8_t>((frame->width >> 8) & 0xFF),
             static_cast<uint8_t>(frame->width & 0xFF),
@@ -973,7 +1039,10 @@ bool sendCameraFrameWebSocket(camera_fb_t* frame) {
     for (size_t i = 0; i < sizeof(metadata); i++) {
         metadata[i] ^= mask[i % 4];
     }
-    if (!writeCameraWebSocketBytes(metadata, sizeof(metadata))) {
+    memcpy(header + headerLength, metadata, sizeof(metadata));
+    headerLength += sizeof(metadata);
+
+    if (!writeCameraWebSocketBytes(header, headerLength)) {
         cameraWebSocketClient.stop();
         cameraWebSocketConnected = false;
         return false;
@@ -1041,6 +1110,9 @@ bool uploadCameraFrame() {
         }
         Serial.printf("[CAMERA] Frame capture failed count=%lu\n",
                       static_cast<unsigned long>(cameraCaptureFailureCount));
+        if (cameraCaptureFailureCount >= CAMERA_CAPTURE_RECOVERY_FAILURES) {
+            recoverCamera("capture-fail");
+        }
         lastCameraUploadAt = millis();
         return false;
     }
@@ -1302,6 +1374,9 @@ bool connectToWifi() {
     updateStatusLed();
 
     WiFi.mode(WIFI_STA);
+#ifdef BOARD_HAS_CAMERA
+    WiFi.setSleep(false);
+#endif
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     const uint32_t startedAt = millis();
@@ -1398,6 +1473,9 @@ void handleNetworkSync() {
             lastReconnectAttemptAt = now;
             Serial.println("[WIFI] Reconnecting...");
             WiFi.disconnect();
+#ifdef BOARD_HAS_CAMERA
+            WiFi.setSleep(false);
+#endif
             WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
             updateStatusLed();
         }
@@ -1435,7 +1513,8 @@ void handleNetworkSync() {
         mqttClient.loop();
     }
 
-    if (stateDirty) {
+    if (stateDirty && now - lastStateReportAttemptAt >= STATE_REPORT_RETRY_INTERVAL_MS) {
+        lastStateReportAttemptAt = now;
         reportState();
     }
 
@@ -1461,15 +1540,17 @@ void handleNetworkSync() {
         handleCameraWebSocket();
     }
 
-    if (deviceRegistered && (cameraStatusDirty || now - lastCameraStatusReportAt >= CAMERA_STATUS_RETRY_INTERVAL_MS)) {
+    if (deviceRegistered
+            && ((cameraStatusDirty && now - lastCameraStatusAttemptAt >= CAMERA_STATUS_RETRY_INTERVAL_MS)
+                || now - lastCameraStatusReportAt >= CAMERA_STATUS_RETRY_INTERVAL_MS)) {
         reportCameraStatus(cameraReady ? "Camera ready" : "Camera unavailable");
     }
 
-    if (deviceRegistered && now - lastCameraControlPollAt >= CAMERA_CONTROL_POLL_INTERVAL_MS) {
+    if (deviceRegistered && (lastCameraControlPollAt == 0 || now - lastCameraControlPollAt >= CAMERA_CONTROL_POLL_INTERVAL_MS)) {
         pollCameraControl();
     }
 
-    if (deviceRegistered && cameraReady && now - lastCameraUploadAt >= currentCameraUploadIntervalMs) {
+    if (deviceRegistered && cameraReady && cameraControlReceived && now - lastCameraUploadAt >= currentCameraUploadIntervalMs) {
         uploadCameraFrame();
     }
 #endif
@@ -1503,8 +1584,9 @@ void setup() {
     Serial.printf("[AUTH] Device-specific API key: %s\n", deviceApiToken.isEmpty() ? "not provisioned" : "provisioned");
 
 #ifdef BOARD_HAS_CAMERA
-    initializeCamera();
-    runCameraSelfTest("boot");
+    if (initializeCamera() && !runCameraSelfTest("boot")) {
+        recoverCamera("boot-retry");
+    }
 #endif
 
     if (!connectToWifi()) {
