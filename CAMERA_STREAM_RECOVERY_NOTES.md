@@ -148,6 +148,21 @@ Conclusion:
 - Further perceived quality improvements should be evaluated in the browser renderer first.
 - Further real FPS improvements still depend mostly on camera/upload cadence, not Java backend frame dispatch.
 
+Rendering v2:
+
+- Added a third browser renderer preset: `Detail`.
+- `Detail` increases shader sharpening compared with `Sharp`, adds weak flat-area denoise, and applies slightly stronger contrast/saturation.
+- `Sharp` now also applies a very small denoise pass to avoid making JPEG block noise stand out too much.
+- WebGL rendering now adjusts sharpen/denoise strength upward slightly when the displayed canvas is larger than the source frame.
+- `Natural` remains the no-enhancement comparison mode.
+
+Rendering pipeline follow-up:
+
+- Browser JPEG decode and canvas draw are now separated.
+- The viewer starts `createImageBitmap` decode immediately when a WebSocket Blob arrives.
+- `requestAnimationFrame` now draws only already-decoded frames, so render FPS should stay closer to source FPS.
+- Dropped frames now primarily mean either decode could not keep up with incoming frames or an already decoded frame was replaced before the next paint.
+
 Follow-up change:
 
 - Backend live interval was lowered from `75 ms` to `60 ms`.
