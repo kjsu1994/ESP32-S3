@@ -1,0 +1,16 @@
+#ifndef ESP32S3_BOARD_DEVKITC_H
+#define ESP32S3_BOARD_DEVKITC_H
+
+#ifndef BOARD_INTERNAL_RGB_PIN
+#define BOARD_INTERNAL_RGB_PIN 48
+#endif
+
+#ifndef BOARD_INTERNAL_RGB_ALT_PIN
+#define BOARD_INTERNAL_RGB_ALT_PIN 38
+#endif
+
+#ifndef BOARD_RGB_COUNT
+#define BOARD_RGB_COUNT 1
+#endif
+
+#endif

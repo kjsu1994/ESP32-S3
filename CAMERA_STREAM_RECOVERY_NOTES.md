@@ -15,12 +15,15 @@ This note records the current camera streaming state, what was tested, what actu
 
 ## Current Working Baseline
 
-Selected live-stream profile in `include/config.local.h`:
+Selected live-stream profile:
 
 ```cpp
+// include/config.defaults.h
 #define CAMERA_UPLOAD_INTERVAL_MS 100
 #define CAMERA_FRAME_SIZE FRAMESIZE_QVGA
 #define CAMERA_JPEG_QUALITY 20
+
+// include/boards/esp32s3_camera_ov2640.h
 #define CAMERA_XCLK_FREQ_HZ 14000000
 ```
 
