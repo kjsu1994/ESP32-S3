@@ -56,7 +56,7 @@
 #endif
 
 #ifndef CAMERA_JPEG_QUALITY
-#define CAMERA_JPEG_QUALITY 32
+#define CAMERA_JPEG_QUALITY 20
 #endif
 
 #ifndef CAMERA_GRAB_MODE

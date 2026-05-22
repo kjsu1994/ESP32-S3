@@ -20,7 +20,7 @@ Current target profile for the next OTA test:
 ```cpp
 // include/config.defaults.h
 #define CAMERA_FRAME_SIZE FRAMESIZE_HVGA
-#define CAMERA_JPEG_QUALITY 32
+#define CAMERA_JPEG_QUALITY 20
 #define CAMERA_FB_COUNT 2
 
 // include/boards/esp32s3_camera_ov5640.h
@@ -108,7 +108,10 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 | QVGA, q20, 14 MHz, backend 100 ms | Viewer result: 265 frames, 4.07 fps, average 5327 bytes; backend ingest 4.0-4.1 fps; ping 0% loss, avg 6 ms. | Selected current profile. |
 | QVGA, q24, 14 MHz, backend 50 ms | Control returned LIVE/50, but ingest stayed around 0.3 fps and ping degraded to 16% loss. | Rejected. |
 | OV5640 HVGA, q32, 14 MHz, backend 75 ms, async server ingest | Backend ingest 4.5 fps, frame size about 6.7-7.0 KB. Firmware status: capture 131 ms, upload 8-9 ms, total 139-140 ms, applied interval 75 ms. Server metrics: copy 9 us, queue 121 us, accept 210 us, notify 71 us. Ping 0% loss, avg 5 ms. | Server/client processing is not the current FPS bottleneck. Next target is camera capture wait and scheduler. |
-| OV5640 HVGA, q32, 14 MHz, backend 75 ms, fb_count=2, async server ingest | Backend ingest reached 9.1 fps, frame size about 6.7-6.8 KB. Firmware status: capture 24 ms, upload 9 ms, total 33 ms, applied interval 75 ms. Server metrics: copy 13 us, queue 78 us, accept 128 us, notify 58 us. Ping 0% loss, avg 7 ms. | Selected current 9-10 fps target profile. |
+| OV5640 HVGA, q32, 14 MHz, backend 75 ms, fb_count=2, async server ingest | Backend ingest reached 9.1 fps, frame size about 6.7-6.8 KB. Firmware status: capture 24 ms, upload 9 ms, total 33 ms, applied interval 75 ms. Server metrics: copy 13 us, queue 78 us, accept 128 us, notify 58 us. Ping 0% loss, avg 7 ms. | Good performance reference. |
+| OV5640 HVGA, q32, 14 MHz, backend 67 ms, fb_count=2, schedule-from-start | Backend ingest stayed around 9.0-9.1 fps. Firmware status: capture 69-91 ms, upload 8-10 ms, total 78-101 ms. Ping 0% loss, avg 11 ms, max 182 ms. | 15 fps not reached; schedule-from-start did not improve this sensor mode. |
+| OV5640 VGA, q32, 14 MHz, backend 67 ms, fb_count=2, schedule-from-start | Backend ingest rose from 6.8 to 8.2 fps after settling. Frame size about 11.4-12.2 KB. Firmware status: capture commonly 73-88 ms with spikes to 199-208 ms, upload 15-27 ms. Ping 0% loss, avg 9 ms, max 117 ms. | VGA streams, but not at 15 fps. Not selected. |
+| OV5640 HVGA, q20, 14 MHz, backend 75 ms, fb_count=2 | Backend ingest stayed around 8.8-9.1 fps. Frame size about 8.5-8.8 KB. Firmware status: capture 0-19 ms, upload 15-18 ms, total 17-37 ms. Ping 0% loss, avg 9 ms, max 63 ms. | Selected current balanced quality/performance profile. |
 
 ## Backend Changes Added In This Iteration
 
@@ -177,7 +180,7 @@ The firmware polls this endpoint periodically and applies only upload interval /
 
 Short term:
 
-- Use the OV5640 target profile: HVGA 480x320, JPEG quality 32, 14 MHz, DRAM `fb_count=2`, backend `LIVE_UPLOAD_INTERVAL_MS 75`.
+- Use the OV5640 target profile: HVGA 480x320, JPEG quality 20, 14 MHz, DRAM `fb_count=2`, backend `LIVE_UPLOAD_INTERVAL_MS 75`.
 - Use the reported `applied_interval_ms` to verify that backend control values are actually applied.
 - Use OTA only for future firmware uploads while evaluating Wi-Fi load.
 - Keep DRAM framebuffer and `fb_count=1`.
@@ -206,7 +209,7 @@ Later:
 1. Start from the current baseline:
    - `CAMERA_XCLK_FREQ_HZ 14000000`
    - `CAMERA_FRAME_SIZE FRAMESIZE_HVGA`
-   - `CAMERA_JPEG_QUALITY 32`
+   - `CAMERA_JPEG_QUALITY 20`
    - `CAMERA_FB_COUNT 2`
    - backend `LIVE_UPLOAD_INTERVAL_MS 75`
    - `CAMERA_FB_IN_DRAM`
