@@ -22,6 +22,9 @@ Current selected live profile:
 #define CAMERA_FRAME_SIZE FRAMESIZE_SVGA
 #define CAMERA_JPEG_QUALITY 18
 #define CAMERA_FB_COUNT 2
+#define CAMERA_SCHEDULE_FROM_START false
+#define CAMERA_ASYNC_ADAPTIVE_SCHEDULER false
+#define CAMERA_ASYNC_PIPELINE true
 
 // include/boards/esp32s3_camera_ov5640.h
 #define CAMERA_SENSOR_NAME "OV5640"
@@ -58,6 +61,44 @@ The backend currently overrides the firmware default interval through camera con
 ```text
 LIVE_UPLOAD_INTERVAL_MS = 60
 ```
+
+## 2026-05-23 Async Pipeline Test Results
+
+Implemented a firmware-side async camera pipeline:
+
+- Capture task owns `esp_camera_fb_get()`.
+- Upload task owns WebSocket/HTTP frame transfer.
+- Only one pending camera frame is kept; older pending frames are returned to the camera driver.
+- A camera network mutex serializes camera frame upload, camera status, and camera control requests so HTTP control/status does not collide with WebSocket frame traffic.
+
+Current selected OTA profile:
+
+```text
+OV5640, SVGA 800x600, JPEG quality 18, XCLK 14 MHz
+DRAM framebuffer, fb_count=2, CAMERA_GRAB_WHEN_EMPTY
+backend LIVE_UPLOAD_INTERVAL_MS=60
+CAMERA_ASYNC_PIPELINE=true
+CAMERA_SCHEDULE_FROM_START=false
+CAMERA_ASYNC_ADAPTIVE_SCHEDULER=false
+```
+
+Measured results:
+
+- `CAMERA_SCHEDULE_FROM_START=true` can produce high client-visible peaks. The browser source FPS reached about `19 fps`, but backend 10 second ingest did not sustain that rate.
+- Server-side sustained ingest with the async path is typically `7.7-8.0 fps`, with one stable sample at `9.0 fps`.
+- The stable `false` schedule test after OTA settled at `7.8`, `7.9`, `8.0`, `9.0`, then `7.7 fps`.
+- Typical stable status after settling: `captureMs=0-24`, `uploadMs=37-66`, `totalMs=37-67`, failures `0/0`.
+- Reboot/reconnect windows can temporarily show WebSocket close `1006`, `fps=0`, or upload spikes near `995 ms`; do not judge a profile from the first reconnect window after OTA.
+- `LIVE_UPLOAD_INTERVAL_MS=50` plus `CAMERA_ASYNC_ADAPTIVE_SCHEDULER=true` was tested and rejected. It applied `intervalMs=50`, but settled around `7.5-7.8 fps`; `captureMs` rose to `48-83 ms`, `totalMs` commonly reached `101-139 ms`, and an upload spike reached `uploadMs=148` / `totalMs=177`.
+- The adaptive scheduler remains available as a disabled experiment flag, but the selected operating profile is the 60 ms finish-based schedule.
+
+Interpretation:
+
+- The previous 4 fps ceiling was not a fixed ESP32-S3 camera limit.
+- The main long-term ceiling is now the end-to-end upload/WebSocket path, not frontend draw time.
+- Browser source/render FPS is a short client window and can show bursts. Backend `camera ingest` is the better sustained-FPS metric.
+- Keep `CAMERA_SCHEDULE_FROM_START=false` as the selected profile unless the goal is explicitly client-side burst behavior rather than stable ingest.
+- Keep `CAMERA_ASYNC_ADAPTIVE_SCHEDULER=false` for SVGA/q18. With `CAMERA_GRAB_WHEN_EMPTY`, starting capture too early makes `esp_camera_fb_get()` wait inside the camera driver instead of increasing sustained FPS.
 
 ## What Was Broken
 
@@ -119,6 +160,8 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 | OV5640 VGA, q15, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms | Recent settled sample: backend ingest avg 7.73 fps, frame size avg 16.3 KB, upload avg 45.5 ms/max 83 ms, total avg 49 ms/max 83 ms. Ping over 90 packets: 0% loss, min 2 ms, max 170 ms, avg 8 ms. | Stable, but not better enough than 60 ms. |
 | OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms | Confirmed `800x600`. Recent stable samples defended about 7.5-8.1 fps, with frame size often around 20-26 KB depending on scene. Typical status after settling showed capture 0-60 ms, upload 50-128 ms, total 59-161 ms, failures 0/0. Earlier 90-packet ping sample had 0% loss, min 2 ms, max 114 ms, avg 12 ms. | Selected current high-quality profile; SVGA increased resolution without collapsing FPS. |
 | OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 75 ms, schedule-from-start | FPS did not break past the same ceiling, while network health got worse: ping 1% loss, max 972 ms, avg 48 ms; upload max 1600 ms, total max 1600 ms. | Rejected and rolled back to finish-based scheduling. |
+| OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 50 ms, async adaptive scheduler | `intervalMs=50` was applied, but settled mostly at 7.5-7.8 fps. Status commonly showed capture 48-83 ms and total 101-139 ms, with one upload spike at 148 ms / total 177 ms. | Rejected; asking for the next frame too early moved the wait into `esp_camera_fb_get()` without raising sustained FPS. |
+| OV5640 SVGA, q18, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 60 ms, async finish-based scheduler | Post-rollback sample recovered to 7.6-8.1 fps. Typical status after settling showed capture 23-27 ms, upload 33-42 ms, total 57-65 ms, failures 0/0; occasional upload spikes still occur. | Selected current high-quality operating profile. |
 
 ## 2026-05-23 Web Client Rendering Iteration
 
@@ -208,13 +251,14 @@ The firmware polls this endpoint periodically and applies only upload interval /
 - Firmware now blocks camera frame upload until at least one control response is received. This prevents slow WebSocket frame writes from starving the control request path during backend/network recovery.
 - Added retry spacing for state, telemetry, health, camera status, and camera control requests. Failed HTTP requests should no longer retry every loop and compete with camera traffic.
 - Increased device WebSocket handshake/header wait to tolerate LAN jitter. Several failed attempts showed the backend accepting the socket but the firmware reading an empty status line and closing it first.
+- Added the async capture/upload pipeline described above. This supersedes the earlier "do not add FreeRTOS task splitting yet" note; the current implementation is intentionally limited to two tasks and one pending frame.
 
 ## What Not To Do Next
 
 - Do not switch back to `XCLK 16 MHz` as the working baseline. It reproduced a boot self-test failure in the latest test. If trying it again, treat it as a single isolated experiment.
 - Do not reintroduce PSRAM framebuffers casually. If testing PSRAM again, do it as a single explicit experiment and verify the boot self-test first.
 - Do not combine multiple camera changes in one flash. Change only one variable at a time.
-- Do not add FreeRTOS task splitting yet. The current bottleneck is upload time; task splitting before the baseline is stable can hide the real failure.
+- Do not add more camera queues/tasks casually. The current async path is deliberately one pending frame plus one upload task; deeper buffering can create fake FPS bursts and higher latency.
 - Do not use runtime frame-size/quality switching yet. Keep camera sensor config stable until ingest is reliable.
 - Do not treat a black screen as a frontend issue until firmware logs show successful `Frame ok=true` and backend logs show `camera ingest`.
 
@@ -242,6 +286,7 @@ Short term:
 - Keep DRAM framebuffer and `fb_count=2`.
 - Keep the capture recovery code unless it causes a new failure. It gives clear logs and avoids permanent black-screen states after transient camera driver failures.
 - Keep `CAMERA_SCHEDULE_FROM_START` disabled. It increased network jitter on SVGA without improving FPS.
+- Keep `CAMERA_ASYNC_ADAPTIVE_SCHEDULER` disabled for the current SVGA profile. The 50 ms adaptive test increased driver wait time without improving sustained FPS.
 - The frontend canvas now draws at display size times device pixel ratio and applies a small contrast/saturation boost, so browser scaling should not hide the extra SVGA detail.
 - Measure actual `upload_ms` under three conditions:
   - no browser viewer
@@ -253,13 +298,13 @@ Short term:
 Medium term:
 
 - Reduce WebSocket upload cost.
-- Consider sending fewer frames when upload time exceeds target interval.
+- Consider sending fewer frames or dropping pending frames more aggressively when upload time exceeds target interval.
 - If trying for higher FPS, first solve upload time. `capture_ms` is already low.
 - Inspect Wi-Fi conditions and server-side WebSocket write/read behavior because upload time is the dominant delay.
 
 Later:
 
-- Only after stable live streaming, revisit task splitting or latest-frame queue.
+- Only after stable live streaming, revisit deeper buffering or alternative transport.
 - Only after stable live streaming, revisit SVGA/HD experiments.
 
 ## Resume Checklist For Next Session
@@ -273,6 +318,7 @@ Later:
    - `CAMERA_FB_IN_DRAM`
    - `CAMERA_GRAB_WHEN_EMPTY`
    - finish-based scheduling (`CAMERA_SCHEDULE_FROM_START false`)
+   - adaptive scheduling disabled (`CAMERA_ASYNC_ADAPTIVE_SCHEDULER false`)
 2. Upload firmware through OTA only:
    - `pio run -c platformio.local.ini -e esp32s3-cam-livingroom-ota -t upload`
 3. Open the web page so backend control returns `LIVE`.

@@ -13,6 +13,9 @@
 #include "esp_camera.h"
 #include <esp_system.h>
 #include <mbedtls/base64.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #endif
 
 #include "config.h"
@@ -98,6 +101,24 @@ uint32_t lastCameraFrameBytes = 0;
 uint16_t lastCameraFrameWidth = 0;
 uint16_t lastCameraFrameHeight = 0;
 uint16_t detectedCameraSensorPid = 0;
+struct CameraQueuedFrame {
+    camera_fb_t* frame = nullptr;
+    uint32_t captureStartedAt = 0;
+    uint32_t capturedAt = 0;
+};
+SemaphoreHandle_t cameraFrameMutex = nullptr;
+SemaphoreHandle_t cameraNetworkMutex = nullptr;
+TaskHandle_t cameraCaptureTaskHandle = nullptr;
+TaskHandle_t cameraUploadTaskHandle = nullptr;
+CameraQueuedFrame pendingCameraFrame;
+volatile bool cameraAsyncUploadInProgress = false;
+volatile bool cameraWebSocketStopRequested = false;
+uint32_t lastCameraAsyncCaptureStartedAt = 0;
+uint32_t cameraAsyncCapturedFrames = 0;
+uint32_t cameraAsyncDroppedPendingFrames = 0;
+uint32_t cameraAsyncSkippedCaptures = 0;
+bool lockCameraNetwork(TickType_t waitTicks);
+void unlockCameraNetwork();
 #endif
 
 LedMode ledMode = LedMode::STATUS;
@@ -715,7 +736,11 @@ bool reportCameraStatus(const String& message) {
             ",\"sensor_pid\":" + String(detectedCameraSensorPid) +
             ",\"message\":\"" + escapeJson(message) + "\"}";
 
+    if (!lockCameraNetwork(pdMS_TO_TICKS(50))) {
+        return false;
+    }
     const bool ok = postJson(buildApiUrl("/api/devices/") + deviceId + "/camera/status", payload);
+    unlockCameraNetwork();
     if (ok) {
         cameraStatusDirty = false;
         lastCameraStatusReportAt = millis();
@@ -766,7 +791,12 @@ void pollCameraControl() {
 
     String responseBody;
     const String url = buildApiUrl("/api/devices/") + deviceId + "/camera/control";
-    if (!getJson(url, responseBody)) {
+    if (!lockCameraNetwork(pdMS_TO_TICKS(50))) {
+        return;
+    }
+    const bool ok = getJson(url, responseBody);
+    unlockCameraNetwork();
+    if (!ok) {
         return;
     }
 
@@ -1036,6 +1066,402 @@ bool postCameraFrameHttp(camera_fb_t* frame) {
     return true;
 }
 
+uint32_t cameraTaskDelayMs(uint32_t delayMs) {
+    return delayMs == 0 ? 1 : delayMs;
+}
+
+bool cameraAsyncPipelineActive() {
+    return CAMERA_ASYNC_PIPELINE
+           && cameraCaptureTaskHandle != nullptr
+           && cameraUploadTaskHandle != nullptr;
+}
+
+bool cameraAsyncShouldWaitForUpload() {
+    return CAMERA_ASYNC_ADAPTIVE_SCHEDULER || !CAMERA_SCHEDULE_FROM_START;
+}
+
+uint32_t cameraAsyncScheduleReference() {
+    return (CAMERA_ASYNC_ADAPTIVE_SCHEDULER || CAMERA_SCHEDULE_FROM_START)
+            ? lastCameraAsyncCaptureStartedAt
+            : lastCameraUploadAt;
+}
+
+void stopCameraWebSocketNow() {
+    cameraWebSocketClient.stop();
+    cameraWebSocketConnected = false;
+    cameraWebSocketStarted = false;
+    cameraWebSocketStopRequested = false;
+}
+
+void requestCameraWebSocketStop() {
+    if (cameraAsyncPipelineActive()) {
+        cameraWebSocketStopRequested = true;
+        cameraWebSocketConnected = false;
+        cameraWebSocketStarted = false;
+        return;
+    }
+    stopCameraWebSocketNow();
+}
+
+bool lockCameraFrameState(TickType_t waitTicks = portMAX_DELAY) {
+    return cameraFrameMutex != nullptr && xSemaphoreTake(cameraFrameMutex, waitTicks) == pdTRUE;
+}
+
+bool lockCameraNetwork(TickType_t waitTicks) {
+    return cameraNetworkMutex == nullptr || xSemaphoreTake(cameraNetworkMutex, waitTicks) == pdTRUE;
+}
+
+void unlockCameraNetwork() {
+    if (cameraNetworkMutex != nullptr) {
+        xSemaphoreGive(cameraNetworkMutex);
+    }
+}
+
+void unlockCameraFrameState() {
+    if (cameraFrameMutex != nullptr) {
+        xSemaphoreGive(cameraFrameMutex);
+    }
+}
+
+void returnQueuedCameraFrame(CameraQueuedFrame& queued) {
+    if (queued.frame != nullptr) {
+        esp_camera_fb_return(queued.frame);
+        queued.frame = nullptr;
+    }
+    queued.captureStartedAt = 0;
+    queued.capturedAt = 0;
+}
+
+bool hasPendingCameraFrame() {
+    bool hasFrame = false;
+    if (lockCameraFrameState(pdMS_TO_TICKS(5))) {
+        hasFrame = pendingCameraFrame.frame != nullptr;
+        unlockCameraFrameState();
+    }
+    return hasFrame;
+}
+
+void clearPendingCameraFrame() {
+    CameraQueuedFrame dropped;
+    if (lockCameraFrameState(pdMS_TO_TICKS(20))) {
+        dropped = pendingCameraFrame;
+        pendingCameraFrame = CameraQueuedFrame();
+        unlockCameraFrameState();
+    }
+    returnQueuedCameraFrame(dropped);
+}
+
+void queueCapturedCameraFrame(const CameraQueuedFrame& queued) {
+    CameraQueuedFrame dropped;
+    bool queuedFrame = false;
+
+    if (lockCameraFrameState(pdMS_TO_TICKS(20))) {
+        if (pendingCameraFrame.frame != nullptr) {
+            dropped = pendingCameraFrame;
+            cameraAsyncDroppedPendingFrames++;
+        }
+        pendingCameraFrame = queued;
+        cameraAsyncCapturedFrames++;
+        queuedFrame = true;
+        unlockCameraFrameState();
+    }
+
+    returnQueuedCameraFrame(dropped);
+    if (!queuedFrame) {
+        CameraQueuedFrame unqueued = queued;
+        returnQueuedCameraFrame(unqueued);
+        return;
+    }
+
+    if (cameraUploadTaskHandle != nullptr) {
+        xTaskNotifyGive(cameraUploadTaskHandle);
+    }
+}
+
+bool takePendingCameraFrame(CameraQueuedFrame& queued) {
+    bool hasFrame = false;
+    if (lockCameraFrameState(pdMS_TO_TICKS(20))) {
+        if (pendingCameraFrame.frame != nullptr) {
+            queued = pendingCameraFrame;
+            pendingCameraFrame = CameraQueuedFrame();
+            hasFrame = true;
+        }
+        unlockCameraFrameState();
+    }
+    return hasFrame;
+}
+
+void recordCameraCaptureFailure(uint32_t captureStartedAt, uint32_t capturedAt, const char* pipeline) {
+    cameraCaptureFailureCount++;
+    lastCameraCaptureMs = capturedAt - captureStartedAt;
+    lastCameraUploadMs = 0;
+    lastCameraTotalMs = capturedAt - captureStartedAt;
+    lastCameraUploadAt = capturedAt;
+    if (cameraCaptureFailureCount == 1) {
+        cameraStatusDirty = true;
+    }
+
+    Serial.printf("[CAMERA] Frame capture failed pipeline=%s count=%lu\n",
+                  pipeline,
+                  static_cast<unsigned long>(cameraCaptureFailureCount));
+
+    if (cameraCaptureFailureCount < CAMERA_CAPTURE_RECOVERY_FAILURES) {
+        return;
+    }
+
+    if (cameraAsyncPipelineActive() && (cameraAsyncUploadInProgress || hasPendingCameraFrame())) {
+        cameraStatusDirty = true;
+        Serial.println("[CAMERA] Recovery deferred while async frame is still owned");
+        return;
+    }
+
+    recoverCamera("capture-fail");
+}
+
+bool finishCameraFrameUpload(camera_fb_t* frame,
+                             uint32_t startedAt,
+                             uint32_t captureStartedAt,
+                             uint32_t capturedAt,
+                             const char* pipeline,
+                             bool allowPostUploadYield) {
+    if (frame == nullptr) {
+        return false;
+    }
+
+    if (frame->format != PIXFORMAT_JPEG) {
+        esp_camera_fb_return(frame);
+        const uint32_t finishedAt = millis();
+        Serial.printf("[CAMERA] Captured frame is not JPEG pipeline=%s\n", pipeline);
+        lastCameraCaptureMs = capturedAt - captureStartedAt;
+        lastCameraUploadMs = 0;
+        lastCameraTotalMs = finishedAt - startedAt;
+        lastCameraUploadAt = finishedAt;
+        cameraStatusDirty = true;
+        return false;
+    }
+
+    bool ok = false;
+    bool triedHttp = false;
+    bool skippedHttpFallback = false;
+    if (lockCameraNetwork(portMAX_DELAY)) {
+        if (CAMERA_USE_WEBSOCKET) {
+            connectCameraWebSocket();
+            handleCameraWebSocket();
+            ok = sendCameraFrameWebSocket(frame);
+        }
+        if (!ok) {
+            const uint32_t now = millis();
+            if (CAMERA_USE_WEBSOCKET && (!CAMERA_HTTP_FALLBACK_ENABLED || now - lastCameraHttpFallbackAt < CAMERA_HTTP_FALLBACK_INTERVAL_MS)) {
+                skippedHttpFallback = true;
+            } else {
+                lastCameraHttpFallbackAt = now;
+                triedHttp = true;
+                ok = postCameraFrameHttp(frame);
+            }
+        } else {
+            handleCameraWebSocket();
+        }
+        unlockCameraNetwork();
+    }
+
+    const size_t frameLength = frame->len;
+    const uint16_t frameWidth = frame->width;
+    const uint16_t frameHeight = frame->height;
+    esp_camera_fb_return(frame);
+
+    const uint32_t finishedAt = millis();
+    if (ok) {
+        cameraUploadFailureCount = 0;
+    } else {
+        cameraUploadFailureCount++;
+    }
+    lastCameraUploadAt = finishedAt;
+    lastCameraCaptureMs = capturedAt - captureStartedAt;
+    lastCameraUploadMs = finishedAt - capturedAt;
+    lastCameraTotalMs = finishedAt - startedAt;
+    lastCameraFrameBytes = frameLength;
+    lastCameraFrameWidth = frameWidth;
+    lastCameraFrameHeight = frameHeight;
+
+    if (finishedAt - lastCameraDiagnosticsLogAt >= CAMERA_DIAGNOSTICS_LOG_INTERVAL_MS) {
+        lastCameraDiagnosticsLogAt = finishedAt;
+        Serial.printf("[CAMERA] Frame ok=%s pipeline=%s transport=%s size=%ux%u bytes=%u capture_ms=%lu upload_ms=%lu total_ms=%lu interval_ms=%lu upload_failures=%lu async_captured=%lu async_dropped=%lu async_skipped=%lu heap=%u\n",
+                      ok ? "true" : "false",
+                      pipeline,
+                      triedHttp ? "http" : (skippedHttpFallback ? "websocket-no-fallback" : "websocket"),
+                      frameWidth,
+                      frameHeight,
+                      static_cast<unsigned int>(frameLength),
+                      static_cast<unsigned long>(capturedAt - captureStartedAt),
+                      static_cast<unsigned long>(finishedAt - capturedAt),
+                      static_cast<unsigned long>(finishedAt - startedAt),
+                      static_cast<unsigned long>(currentCameraUploadIntervalMs),
+                      static_cast<unsigned long>(cameraUploadFailureCount),
+                      static_cast<unsigned long>(cameraAsyncCapturedFrames),
+                      static_cast<unsigned long>(cameraAsyncDroppedPendingFrames),
+                      static_cast<unsigned long>(cameraAsyncSkippedCaptures),
+                      ESP.getFreeHeap());
+    }
+    cameraStatusDirty = true;
+    if (allowPostUploadYield && CAMERA_SCHEDULE_FROM_START && CAMERA_MIN_POST_UPLOAD_YIELD_MS > 0) {
+        delay(CAMERA_MIN_POST_UPLOAD_YIELD_MS);
+    }
+    return ok;
+}
+
+bool uploadQueuedCameraFrame(const CameraQueuedFrame& queued) {
+    if (queued.frame == nullptr) {
+        return false;
+    }
+
+    if (!cameraReady || WiFi.status() != WL_CONNECTED || !deviceRegistered || !cameraStreamingEnabled || otaInProgress) {
+        CameraQueuedFrame dropped = queued;
+        returnQueuedCameraFrame(dropped);
+        lastCameraUploadAt = millis();
+        return false;
+    }
+
+    return finishCameraFrameUpload(queued.frame,
+                                   queued.captureStartedAt,
+                                   queued.captureStartedAt,
+                                   queued.capturedAt,
+                                   "async",
+                                   false);
+}
+
+void cameraUploadTask(void*) {
+    Serial.printf("[CAMERA] Async upload task started core=%d\n", xPortGetCoreID());
+    for (;;) {
+        if (cameraWebSocketStopRequested) {
+            stopCameraWebSocketNow();
+        }
+
+        CameraQueuedFrame queued;
+        if (!takePendingCameraFrame(queued)) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(cameraTaskDelayMs(CAMERA_ASYNC_UPLOAD_WAIT_MS)));
+            continue;
+        }
+
+        if (cameraWebSocketStopRequested) {
+            stopCameraWebSocketNow();
+        }
+
+        cameraAsyncUploadInProgress = true;
+        uploadQueuedCameraFrame(queued);
+        cameraAsyncUploadInProgress = false;
+    }
+}
+
+void cameraCaptureTask(void*) {
+    Serial.printf("[CAMERA] Async capture task started core=%d\n", xPortGetCoreID());
+    for (;;) {
+        if (!cameraReady
+                || WiFi.status() != WL_CONNECTED
+                || !deviceRegistered
+                || !cameraControlReceived
+                || !cameraStreamingEnabled
+                || otaInProgress) {
+            if (!cameraStreamingEnabled || otaInProgress) {
+                clearPendingCameraFrame();
+            }
+            vTaskDelay(pdMS_TO_TICKS(cameraTaskDelayMs(25)));
+            continue;
+        }
+
+        if (cameraAsyncShouldWaitForUpload() && cameraAsyncUploadInProgress) {
+            vTaskDelay(pdMS_TO_TICKS(cameraTaskDelayMs(CAMERA_ASYNC_CAPTURE_POLL_MS)));
+            continue;
+        }
+
+        const uint32_t now = millis();
+        const uint32_t scheduleReference = cameraAsyncScheduleReference();
+        if (scheduleReference != 0 && now - scheduleReference < currentCameraUploadIntervalMs) {
+            vTaskDelay(pdMS_TO_TICKS(cameraTaskDelayMs(CAMERA_ASYNC_CAPTURE_POLL_MS)));
+            continue;
+        }
+
+        if (hasPendingCameraFrame()) {
+            cameraAsyncSkippedCaptures++;
+            vTaskDelay(pdMS_TO_TICKS(cameraTaskDelayMs(CAMERA_ASYNC_CAPTURE_POLL_MS)));
+            continue;
+        }
+
+        const uint32_t captureStartedAt = millis();
+        lastCameraAsyncCaptureStartedAt = captureStartedAt;
+        lastCameraUploadStartedAt = captureStartedAt;
+        camera_fb_t* frame = esp_camera_fb_get();
+        const uint32_t capturedAt = millis();
+        if (frame == nullptr) {
+            recordCameraCaptureFailure(captureStartedAt, capturedAt, "async");
+            vTaskDelay(pdMS_TO_TICKS(cameraTaskDelayMs(20)));
+            continue;
+        }
+        cameraCaptureFailureCount = 0;
+
+        CameraQueuedFrame queued;
+        queued.frame = frame;
+        queued.captureStartedAt = captureStartedAt;
+        queued.capturedAt = capturedAt;
+        queueCapturedCameraFrame(queued);
+
+        vTaskDelay(pdMS_TO_TICKS(cameraTaskDelayMs(CAMERA_ASYNC_CAPTURE_POLL_MS)));
+    }
+}
+
+void startCameraAsyncTasks() {
+    if (!CAMERA_ASYNC_PIPELINE) {
+        return;
+    }
+
+    if (cameraFrameMutex == nullptr) {
+        cameraFrameMutex = xSemaphoreCreateMutex();
+        if (cameraFrameMutex == nullptr) {
+            Serial.println("[CAMERA] Async frame mutex allocation failed");
+            cameraStatusDirty = true;
+            return;
+        }
+    }
+    if (cameraNetworkMutex == nullptr) {
+        cameraNetworkMutex = xSemaphoreCreateMutex();
+        if (cameraNetworkMutex == nullptr) {
+            Serial.println("[CAMERA] Async network mutex allocation failed");
+            cameraStatusDirty = true;
+            return;
+        }
+    }
+
+    if (cameraUploadTaskHandle == nullptr) {
+        const BaseType_t uploadCreated = xTaskCreatePinnedToCore(cameraUploadTask,
+                                                                 "camera-upload",
+                                                                 CAMERA_ASYNC_UPLOAD_TASK_STACK_SIZE,
+                                                                 nullptr,
+                                                                 CAMERA_ASYNC_UPLOAD_TASK_PRIORITY,
+                                                                 &cameraUploadTaskHandle,
+                                                                 CAMERA_ASYNC_TASK_CORE);
+        if (uploadCreated != pdPASS) {
+            cameraUploadTaskHandle = nullptr;
+            Serial.println("[CAMERA] Async upload task allocation failed");
+            cameraStatusDirty = true;
+            return;
+        }
+    }
+
+    if (cameraCaptureTaskHandle == nullptr) {
+        const BaseType_t captureCreated = xTaskCreatePinnedToCore(cameraCaptureTask,
+                                                                  "camera-capture",
+                                                                  CAMERA_ASYNC_CAPTURE_TASK_STACK_SIZE,
+                                                                  nullptr,
+                                                                  CAMERA_ASYNC_CAPTURE_TASK_PRIORITY,
+                                                                  &cameraCaptureTaskHandle,
+                                                                  CAMERA_ASYNC_TASK_CORE);
+        if (captureCreated != pdPASS) {
+            cameraCaptureTaskHandle = nullptr;
+            Serial.println("[CAMERA] Async capture task allocation failed");
+            cameraStatusDirty = true;
+        }
+    }
+}
+
 bool uploadCameraFrame() {
     if (!cameraReady || WiFi.status() != WL_CONNECTED || !deviceRegistered) {
         return false;
@@ -1053,90 +1479,12 @@ bool uploadCameraFrame() {
     camera_fb_t* frame = esp_camera_fb_get();
     const uint32_t capturedAt = millis();
     if (frame == nullptr) {
-        cameraCaptureFailureCount++;
-        lastCameraCaptureMs = capturedAt - captureStartedAt;
-        lastCameraUploadMs = 0;
-        lastCameraTotalMs = capturedAt - startedAt;
-        if (cameraCaptureFailureCount == 1) {
-            cameraStatusDirty = true;
-        }
-        Serial.printf("[CAMERA] Frame capture failed count=%lu\n",
-                      static_cast<unsigned long>(cameraCaptureFailureCount));
-        if (cameraCaptureFailureCount >= CAMERA_CAPTURE_RECOVERY_FAILURES) {
-            recoverCamera("capture-fail");
-        }
-        lastCameraUploadAt = capturedAt;
+        recordCameraCaptureFailure(captureStartedAt, capturedAt, "sync");
         return false;
     }
     cameraCaptureFailureCount = 0;
 
-    if (frame->format != PIXFORMAT_JPEG) {
-        esp_camera_fb_return(frame);
-        Serial.println("[CAMERA] Captured frame is not JPEG");
-        lastCameraUploadAt = millis();
-        return false;
-    }
-
-    bool ok = false;
-    bool triedHttp = false;
-    bool skippedHttpFallback = false;
-    if (CAMERA_USE_WEBSOCKET) {
-        connectCameraWebSocket();
-        handleCameraWebSocket();
-        ok = sendCameraFrameWebSocket(frame);
-    }
-    if (!ok) {
-        const uint32_t now = millis();
-        if (CAMERA_USE_WEBSOCKET && (!CAMERA_HTTP_FALLBACK_ENABLED || now - lastCameraHttpFallbackAt < CAMERA_HTTP_FALLBACK_INTERVAL_MS)) {
-            skippedHttpFallback = true;
-        } else {
-            lastCameraHttpFallbackAt = now;
-            triedHttp = true;
-            ok = postCameraFrameHttp(frame);
-        }
-    }
-
-    const size_t frameLength = frame->len;
-    const uint16_t frameWidth = frame->width;
-    const uint16_t frameHeight = frame->height;
-    esp_camera_fb_return(frame);
-
-    if (ok) {
-        cameraUploadFailureCount = 0;
-        lastCameraUploadAt = millis();
-    } else {
-        cameraUploadFailureCount++;
-        lastCameraUploadAt = millis();
-    }
-
-    const uint32_t finishedAt = millis();
-    lastCameraCaptureMs = capturedAt - captureStartedAt;
-    lastCameraUploadMs = finishedAt - capturedAt;
-    lastCameraTotalMs = finishedAt - startedAt;
-    lastCameraFrameBytes = frameLength;
-    lastCameraFrameWidth = frameWidth;
-    lastCameraFrameHeight = frameHeight;
-
-    if (finishedAt - lastCameraDiagnosticsLogAt >= CAMERA_DIAGNOSTICS_LOG_INTERVAL_MS) {
-        lastCameraDiagnosticsLogAt = finishedAt;
-        Serial.printf("[CAMERA] Frame ok=%s transport=%s size=%ux%u bytes=%u capture_ms=%lu upload_ms=%lu total_ms=%lu interval_ms=%lu upload_failures=%lu heap=%u\n",
-                      ok ? "true" : "false",
-                      triedHttp ? "http" : (skippedHttpFallback ? "websocket-no-fallback" : "websocket"),
-                      frameWidth,
-                      frameHeight,
-                      static_cast<unsigned int>(frameLength),
-                      static_cast<unsigned long>(capturedAt - captureStartedAt),
-                      static_cast<unsigned long>(finishedAt - capturedAt),
-                      static_cast<unsigned long>(finishedAt - startedAt),
-                      static_cast<unsigned long>(currentCameraUploadIntervalMs),
-                      static_cast<unsigned long>(cameraUploadFailureCount),
-                      ESP.getFreeHeap());
-    }
-    cameraStatusDirty = true;
-    if (CAMERA_SCHEDULE_FROM_START && CAMERA_MIN_POST_UPLOAD_YIELD_MS > 0) {
-        delay(CAMERA_MIN_POST_UPLOAD_YIELD_MS);
-    }
-    return ok;
+    return finishCameraFrameUpload(frame, startedAt, captureStartedAt, capturedAt, "sync", true);
 }
 #endif
 
@@ -1419,9 +1767,8 @@ void handleNetworkSync() {
             lastMqttConnected = false;
             mqttClient.disconnect();
 #ifdef BOARD_HAS_CAMERA
-            cameraWebSocketClient.stop();
-            cameraWebSocketConnected = false;
-            cameraWebSocketStarted = false;
+            clearPendingCameraFrame();
+            requestCameraWebSocketStop();
 #endif
             Serial.println("[WIFI] Connection lost");
         } else {
@@ -1499,7 +1846,9 @@ void handleNetworkSync() {
     }
 
 #ifdef BOARD_HAS_CAMERA
-    if (CAMERA_USE_WEBSOCKET && cameraWebSocketStarted) {
+    startCameraAsyncTasks();
+
+    if (CAMERA_USE_WEBSOCKET && cameraWebSocketStarted && !cameraAsyncPipelineActive()) {
         handleCameraWebSocket();
     }
 
@@ -1514,7 +1863,11 @@ void handleNetworkSync() {
     }
 
     const uint32_t cameraScheduleReference = CAMERA_SCHEDULE_FROM_START ? lastCameraUploadStartedAt : lastCameraUploadAt;
-    if (deviceRegistered && cameraReady && cameraControlReceived && now - cameraScheduleReference >= currentCameraUploadIntervalMs) {
+    if (!cameraAsyncPipelineActive()
+            && deviceRegistered
+            && cameraReady
+            && cameraControlReceived
+            && now - cameraScheduleReference >= currentCameraUploadIntervalMs) {
         uploadCameraFrame();
     }
 #endif
@@ -1551,6 +1904,7 @@ void setup() {
     if (initializeCamera() && !runCameraSelfTest("boot")) {
         recoverCamera("boot-retry");
     }
+    startCameraAsyncTasks();
 #endif
 
     if (!connectToWifi()) {
