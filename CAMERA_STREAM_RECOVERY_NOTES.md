@@ -15,12 +15,12 @@ This note records the current camera streaming state, what was tested, what actu
 
 ## Current Working Baseline
 
-Current target profile for the next OTA test:
+Current selected live profile:
 
 ```cpp
 // include/config.defaults.h
-#define CAMERA_FRAME_SIZE FRAMESIZE_HVGA
-#define CAMERA_JPEG_QUALITY 20
+#define CAMERA_FRAME_SIZE FRAMESIZE_VGA
+#define CAMERA_JPEG_QUALITY 15
 #define CAMERA_FB_COUNT 2
 
 // include/boards/esp32s3_camera_ov5640.h
@@ -28,14 +28,14 @@ Current target profile for the next OTA test:
 #define CAMERA_XCLK_FREQ_HZ 14000000
 
 // backend CameraService
-LIVE_UPLOAD_INTERVAL_MS = 75
+LIVE_UPLOAD_INTERVAL_MS = 50
 ```
 
 The camera driver is currently stable only after changing framebuffer allocation away from PSRAM:
 
 ```cpp
 config.fb_location = CAMERA_FB_IN_DRAM;
-config.fb_count = 1;
+config.fb_count = 2;
 config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 ```
 
@@ -112,6 +112,8 @@ That means `esp_camera_fb_get()` could not obtain a frame from the camera driver
 | OV5640 HVGA, q32, 14 MHz, backend 67 ms, fb_count=2, schedule-from-start | Backend ingest stayed around 9.0-9.1 fps. Firmware status: capture 69-91 ms, upload 8-10 ms, total 78-101 ms. Ping 0% loss, avg 11 ms, max 182 ms. | 15 fps not reached; schedule-from-start did not improve this sensor mode. |
 | OV5640 VGA, q32, 14 MHz, backend 67 ms, fb_count=2, schedule-from-start | Backend ingest rose from 6.8 to 8.2 fps after settling. Frame size about 11.4-12.2 KB. Firmware status: capture commonly 73-88 ms with spikes to 199-208 ms, upload 15-27 ms. Ping 0% loss, avg 9 ms, max 117 ms. | VGA streams, but not at 15 fps. Not selected. |
 | OV5640 HVGA, q20, 14 MHz, backend 75 ms, fb_count=2 | Backend ingest stayed around 8.8-9.1 fps. Frame size about 8.5-8.8 KB. Firmware status: capture 0-19 ms, upload 15-18 ms, total 17-37 ms. Ping 0% loss, avg 9 ms, max 63 ms. | Selected current balanced quality/performance profile. |
+| OV5640 VGA, q15, 16 MHz, PSRAM fb_count=2, GRAB_LATEST | Community-style profile initially reported VGA but then fell into repeated capture timeouts (`captureMs` 4067-8000, no frame bytes) and even OTA authentication needed streaming to be disabled temporarily for recovery. | Rejected for this board state. |
+| OV5640 VGA, q15, 14 MHz, DRAM fb_count=2, GRAB_WHEN_EMPTY, backend 50 ms | Backend ingest stayed mostly 8.0-9.0 fps after settling. Frame size about 15.1-17.8 KB. Firmware status usually total 26-104 ms, with one observed upload spike to 1407 ms. Ping over 120 packets: 0% loss, min 2 ms, max 127 ms, avg 11 ms. | Selected current VGA quality profile. |
 
 ## Backend Changes Added In This Iteration
 
@@ -180,17 +182,17 @@ The firmware polls this endpoint periodically and applies only upload interval /
 
 Short term:
 
-- Use the OV5640 target profile: HVGA 480x320, JPEG quality 20, 14 MHz, DRAM `fb_count=2`, backend `LIVE_UPLOAD_INTERVAL_MS 75`.
+- Use the OV5640 target profile: VGA 640x480, JPEG quality 15, 14 MHz, DRAM `fb_count=2`, `CAMERA_GRAB_WHEN_EMPTY`, backend `LIVE_UPLOAD_INTERVAL_MS 50`.
 - Use the reported `applied_interval_ms` to verify that backend control values are actually applied.
 - Use OTA only for future firmware uploads while evaluating Wi-Fi load.
-- Keep DRAM framebuffer and `fb_count=1`.
+- Keep DRAM framebuffer and `fb_count=2`.
 - Keep the capture recovery code unless it causes a new failure. It gives clear logs and avoids permanent black-screen states after transient camera driver failures.
 - Measure actual `upload_ms` under three conditions:
   - no browser viewer
   - one browser viewer on local LAN
   - one viewer through public route
 - Verify whether control endpoint changes the interval between `IDLE` and `LIVE` as expected.
-- Avoid reducing the post-upload delay below `100 ms` while Wi-Fi/upload stability is still sensitive.
+- If stability drops, compare backend `LIVE_UPLOAD_INTERVAL_MS 60` and `75` before reducing quality or resolution.
 
 Medium term:
 
@@ -208,10 +210,10 @@ Later:
 
 1. Start from the current baseline:
    - `CAMERA_XCLK_FREQ_HZ 14000000`
-   - `CAMERA_FRAME_SIZE FRAMESIZE_HVGA`
-   - `CAMERA_JPEG_QUALITY 20`
+   - `CAMERA_FRAME_SIZE FRAMESIZE_VGA`
+   - `CAMERA_JPEG_QUALITY 15`
    - `CAMERA_FB_COUNT 2`
-   - backend `LIVE_UPLOAD_INTERVAL_MS 75`
+   - backend `LIVE_UPLOAD_INTERVAL_MS 50`
    - `CAMERA_FB_IN_DRAM`
    - `CAMERA_GRAB_WHEN_EMPTY`
 2. Upload firmware through OTA only:
